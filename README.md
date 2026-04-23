@@ -6,7 +6,7 @@ Blocks-DB is a modular serverless vector database built on Lithops and AWS Lambd
 
 ## Requirements
 
-- **Python 3.10** (exact version, compatible with 3.10.x)
+- **Python 3.10** (venv use recommended)
 - **Docker** & **Docker Hub account**
 - **AWS account** with access to: S3, Lambda, DynamoDB, ECR, IAM
 - **Existing S3 bucket** for storing vectors and indexes
@@ -17,7 +17,7 @@ Blocks-DB is a modular serverless vector database built on Lithops and AWS Lambd
 
 ```bash
 # Clone the repository
-git clone github.com/Oct-HI/blocks-db/
+git clone [github.com/Oct-HI/blocks-db-wip/] (https://github.com/Oct-HI/blocks-db-wip)
 cd blocks-db
 
 # (Optional) Create virtual environment
