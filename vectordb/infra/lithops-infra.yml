@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Blocks-DB Lithops Infrastructure"
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: "Existing S3 bucket name for Lithops storage"
+  RuntimeName:
+    Type: String
+    Default: "blocks-db-runtime"
+    Description: "Name for the Lithops runtime Docker image"
+
+Resources:
+  LithopsLambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "lithops-lambda-execution-role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "lithops-lambda-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3BucketName}"
+                  - !Sub "arn:aws:s3:::${S3BucketName}/*"
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: "Allow"
+                Action:
+                  - "ec2:DescribeVpcEndpoints"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeVpcAttribute"
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:DeleteNetworkInterface"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:AttachNetworkInterface"
+                  - "ec2:DetachNetworkInterface"
+                Resource: "*"
+
+  LithopsECRRepository:
+    Type: "AWS::ECR::Repository"
+    Properties:
+      RepositoryName: !Ref RuntimeName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  LambdaExecutionRoleOutput:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "lithops-lambda-execution-role-${AWS::StackName}-v2"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "lithops-lambda-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:*"
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3BucketName}"
+                  - !Sub "arn:aws:s3:::${S3BucketName}/*"
+              - Effect: "Allow"
+                Action:
+                  - "logs:*"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: "Allow"
+                Action:
+                  - "ec2:*"
+                Resource: "*"
+
+Outputs:
+  LambdaExecutionRoleARN:
+    Description: "ARN of the Lambda execution role"
+    Value: !GetAtt LithopsLambdaExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaExecutionRoleARN"
+
+  LambdaExecutionRoleARNv2:
+    Description: "ARN of the Lambda execution role (v2)"
+    Value: !GetAtt LambdaExecutionRoleOutput.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaExecutionRoleARNv2"
+
+  ECRRepositoryURI:
+    Description: "URI of the ECR repository"
+    Value: !GetAtt LithopsECRRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AWS::StackName}-ECRRepositoryURI"
+
+  ECRRepositoryName:
+    Description: "Name of the ECR repository"
+    Value: !Ref LithopsECRRepository
+    Export:
+      Name: !Sub "${AWS::StackName}-ECRRepositoryName"

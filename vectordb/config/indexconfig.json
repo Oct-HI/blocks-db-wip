@@ -1,0 +1,21 @@
+{
+  "features": 96,
+  "num_vectors": -1,
+  "k_search": 10,
+  "k_result": 10,
+  "skip_init": false,
+  "skip_kmeans": false,
+  "kmeans_version": "unbalanced",
+  "implementation": "blocks",
+
+  "replication": 1.0,
+  "num_index": 16,
+  "num_centroids_search": 4,
+  "k": 512,
+  "n_probe": 32,
+  "query_batch_size": 4,
+
+  "index_mem": 10240,
+  "search_map_mem": 8192,
+  "search_reduce_mem": 2048
+}

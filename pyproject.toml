@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blocks-db"
+version = "0.1.0"
+description = "Serverless distributed vector database using Lithops"
+authors = [
+    { name="name", email="name@email.com" }
+]
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+
+dependencies = [
+    "orjson",
+    "lithops==3.6.3",
+    "faiss-cpu",
+    "pandas",
+    "boto3",
+    "numpy"
+]
+
+[project.scripts]
+blocks-db = "vectordb.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vectordb*"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"vectordb.infra" = ["*.yml", "*.yaml", "Dockerfile.lambda", "Dockerfile.*"]
+"vectordb.infra.cloudformation" = ["*.yml", "*.yaml"]

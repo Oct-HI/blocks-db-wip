@@ -1,0 +1,19 @@
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y \
+    g++ \
+    make \
+    cmake \
+    zip \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    faiss-cpu \
+    "numpy<2" \
+    orjson
+
+RUN mkdir -p /python/lib/python3.10/site-packages && \
+    cp -r /usr/local/lib/python3.10/site-packages/* /python/lib/python3.10/site-packages/
+
+CMD ["python", "-c", "import faiss; import numpy; import orjson; print('ok')"]
