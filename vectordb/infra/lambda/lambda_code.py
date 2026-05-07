@@ -16,7 +16,7 @@ import io
 import json
 import os
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import faiss
 import numpy as np
@@ -26,7 +26,6 @@ s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "__DYNAMODB_TABLE__")
-STORAGE_BUCKET = os.environ.get("STORAGE_BUCKET", "")
 DEFAULT_THRESHOLD_BYTES = int(os.environ.get("THRESHOLD_SIZE_BYTES", "__THRESHOLD_SIZE__"))
 INDEX_IMPLEMENTATION = os.environ.get("INDEX_IMPLEMENTATION", "blocks")
 BYTES_PER_VECTOR = 8 + 96 * 8
@@ -200,14 +199,6 @@ def get_starting_index_from_config(bucket, dataset):
     return 0
 
 
-def get_starting_index():
-    """Get the configured starting index (set once from config)."""
-    global _configured_starting_index
-    if _configured_starting_index is None:
-        return 0
-    return _configured_starting_index
-
-
 def ensure_global_metadata(table, bucket=None, dataset=None):
     """Ensure the GLOBAL_CONFIG metadata item exists with initial values."""
     if bucket and dataset and _configured_starting_index is None:
@@ -230,97 +221,31 @@ def ensure_global_metadata(table, bucket=None, dataset=None):
 
 
 def move_indexed_files_to_processed(bucket: str, table, centroid_id: int):
-    """Move processed files from pending/ to processed/{dataset}/."""
+    """Delete processed files from pending/ (the processed batch is written separately with corrected IDs)."""
     files = get_files_for_centroid(centroid_id, table)
     if not files:
         return
     
-    datasets = set(f.get("dataset", "default") for f in files)
-    
     for f in files:
         try:
             source_key = f"{f['prefix']}/{f['file_key']}"
-            dataset = f.get("dataset", "default")
-            dest_key = f"processed/{dataset}/{f['file_key']}"
-            s3.copy_object(Bucket=bucket, CopySource={'Bucket': bucket, 'Key': source_key}, Key=dest_key)
             s3.delete_object(Bucket=bucket, Key=source_key)
-            print(f"Moved {source_key} -> {dest_key}")
+            print(f"Deleted processed pending file: {source_key}")
         except Exception as e:
-            print(f"Error moving file {f.get('file_key')}: {e}")
+            print(f"Error deleting file {f.get('file_key')}: {e}")
 
 
-def process_vector_file(bucket: str, key: str, table, threshold_bytes: int = None) -> Dict[str, Any]:
-    """Process a single vector CSV file and trigger indexing if threshold reached."""
-    
-    if threshold_bytes is None:
-        threshold_bytes = DEFAULT_THRESHOLD_BYTES
-    
-    head = s3.head_object(Bucket=bucket, Key=key)
-    file_size = head["ContentLength"]
-    metadata = head.get("Metadata", {})
-    
-    try:
-        response = table.update_item(
-            Key={"centroid_id": "GLOBAL_CONFIG", "sk": "META"},
-            UpdateExpression="SET current_accumulated_size = if_not_exists(current_accumulated_size, :zero) + :s",
-            ExpressionAttributeValues={":s": file_size, ":zero": 0},
-            ReturnValues="ALL_NEW"
-        )
-        
-        attrs = response["Attributes"]
-        current_centroid_id = int(attrs.get("current_centroid_id", 0))
-        total_size = int(attrs.get("current_accumulated_size", 0))
-        
-    except ClientError as e:
-        print(f"DynamoDB error: {e}")
-        raise
-    
-    parts = key.split("/")
-    dataset_name = parts[1] if len(parts) > 1 else "default"
-    
-    try:
-        table.put_item(Item={
-            "centroid_id": str(current_centroid_id),
-            "sk": f"FILE#{key}",
-            "prefix": "/".join(parts[:-1]),
-            "file_key": parts[-1],
-            "dataset": dataset_name,
-            "size": file_size,
-            "timestamp": int(time.time() * 1000)
-        })
-    except ClientError as e:
-        print(f"Error saving file record: {e}")
-    
-    if total_size >= threshold_bytes:
-        print(f"Threshold reached: {total_size - threshold_bytes} bytes over")
-        
-        try:
-            response = table.update_item(
-                Key={"centroid_id": "GLOBAL_CONFIG", "sk": "META"},
-                UpdateExpression="SET current_centroid_id = current_centroid_id + :inc, current_accumulated_size = :zero",
-                ConditionExpression="current_centroid_id = :old_id",
-                ExpressionAttributeValues={
-                    ":inc": 1,
-                    ":zero": 0,
-                    ":old_id": current_centroid_id
-                },
-                ReturnValues="ALL_NEW"
-            )
-            
-            new_centroid_id = int(response["Attributes"]["current_centroid_id"])
-            print(f"Acquired centroid {current_centroid_id}, incremented to {new_centroid_id}")
-            
-            create_index_for_centroid(current_centroid_id, bucket, dataset_name, table)
-            move_indexed_files_to_processed(bucket, dataset_name, get_files_for_centroid(current_centroid_id, table))
-            print(f"Index created for centroid {current_centroid_id}")
-            
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                print("Another worker already started indexing - skipping")
-            else:
-                raise
-    
-    return {"centroid": current_centroid_id, "total_size": total_size, "dataset": dataset_name, "threshold_bytes": threshold_bytes}
+def save_processed_batch(bucket: str, dataset: str, centroid_id: int, new_ids: List[int], vectors: List[List[float]]) -> None:
+    """Write a batch CSV with corrected IDs to processed/."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["id", "vector"])
+    for vid, vec in zip(new_ids, vectors):
+        writer.writerow([vid, " ".join(str(x) for x in vec)])
+
+    batch_key = f"processed/{dataset}/batch_{centroid_id}.csv"
+    s3.put_object(Bucket=bucket, Key=batch_key, Body=buffer.getvalue().encode("utf-8"))
+    print(f"Saved processed batch: {batch_key} with {len(vectors)} vectors, IDs {new_ids[0]}-{new_ids[-1]}")
 
 
 def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table) -> None:
@@ -369,8 +294,9 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
     if not vectors or features is None:
         return
     
-    next_available_id = get_next_available_id(bucket, dataset)
-    new_ids = reassign_ids(original_ids, next_available_id)
+    # Use atomic DynamoDB counter to get and reserve IDs
+    next_available_id = get_next_available_id_atomic(bucket, dataset, len(original_ids))
+    new_ids = list(range(next_available_id, next_available_id + len(original_ids)))
     print(f"Reassigning IDs: {len(original_ids)} vectors from IDs {min(original_ids)}-{max(original_ids)} to {next_available_id}-{next_available_id + len(new_ids) - 1}")
     
     start = time.time()
@@ -396,31 +322,10 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
     print(f"Stored index at indexes/{dataset}/{INDEX_IMPLEMENTATION}/centroid_{centroid_id}.ann in {store_time:.2f}s")
     
     update_indexed_tracking(bucket, dataset, new_ids)
+
+    save_processed_batch(bucket, dataset, centroid_id, new_ids, vectors)
     
     update_config_num_index(bucket, dataset, centroid_id + 1)
-
-
-def track_indexed_files(bucket: str, dataset: str, files: List[Dict]):
-    """Mark source CSV files as indexed (keep files, track in S3)."""
-    indexed_files_key = f"indexed_files_{dataset}.json"
-    try:
-        existing = s3.get_object(Bucket=bucket, Key=indexed_files_key)
-        import orjson
-        indexed_set = set(orjson.loads(existing["Body"].read()))
-    except:
-        indexed_set = set()
-    
-    for f in files:
-        indexed_set.add(f"{f['prefix']}/{f['file_key']}")
-    
-    import orjson
-    s3.put_object(
-        Bucket=bucket,
-        Key=indexed_files_key,
-        Body=orjson.dumps(list(indexed_set)),
-        ContentType="application/json"
-    )
-    print(f"Tracked {len(files)} files as indexed (files kept)")
 
 
 def update_config_num_index(bucket: str, dataset: str, num_index: int):
@@ -447,27 +352,33 @@ def update_config_num_index(bucket: str, dataset: str, num_index: int):
         print(f"Config num_index unchanged: {old_num_index}")
 
 
-def get_next_available_id(bucket: str, dataset: str) -> int:
-    """Get the next available vector ID by reading the tracking file."""
-    key = f"indexed_ids_{dataset}.json"
+def get_next_available_id_atomic(bucket: str, dataset: str, count: int) -> int:
+    """Atomically get and reserve the next `count` IDs from DynamoDB. Returns the starting ID."""
+    global dynamodb
+    if isinstance(dynamodb, boto3.resources.factory.ServiceResource):
+        table = dynamodb.Table(DYNAMODB_TABLE)
+    else:
+        # Re-initialize if needed
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(DYNAMODB_TABLE)
+    
     try:
-        existing = s3.get_object(Bucket=bucket, Key=key)
-        import orjson
-        indexed_ids = orjson.loads(existing["Body"].read())
-        if indexed_ids:
-            return max(indexed_ids) + 1
-    except:
-        pass
-    return 0
-
-
-def reassign_ids(ids: List[int], start_id: int) -> List[int]:
-    """Reassign vector IDs starting from start_id."""
-    return list(range(start_id, start_id + len(ids)))
+        response = table.update_item(
+            Key={"centroid_id": "ID_TRACKER", "sk": dataset},
+            UpdateExpression="SET next_id = if_not_exists(next_id, :zero) + :inc",
+            ExpressionAttributeValues={":inc": count, ":zero": 0},
+            ReturnValues="ALL_NEW"
+        )
+        # Return the starting ID (value after increment minus count)
+        # Convert Decimal to int since DynamoDB returns Decimal type
+        return int(response["Attributes"]["next_id"] - count)
+    except Exception as e:
+        print(f"Error getting next ID atomically: {e}")
+        raise
 
 
 def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
-    """Track indexed vector IDs in S3."""
+    """Track indexed vector IDs in S3 for status commands (optional with atomic DynamoDB counter)."""
     key = f"indexed_ids_{dataset}.json"
     try:
         existing = s3.get_object(Bucket=bucket, Key=key)
@@ -475,12 +386,10 @@ def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
         indexed_set = set(orjson.loads(existing["Body"].read()))
     except:
         indexed_set = set()
-    
-    next_id = max(indexed_set) + 1 if indexed_set else 0
-    new_ids = reassign_ids(ids, next_id)
-    
-    indexed_set.update(new_ids)
-    
+
+    # IDs are already reassigned by create_index_for_centroid()
+    indexed_set.update(ids)
+
     import orjson
     s3.put_object(
         Bucket=bucket,
@@ -488,8 +397,8 @@ def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
         Body=orjson.dumps(list(indexed_set)),
         ContentType="application/json"
     )
-    
-    return new_ids
+
+    return ids
 
 
 def get_files_for_centroid(centroid_id: int, table) -> List[Dict]:

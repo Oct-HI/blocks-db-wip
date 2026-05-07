@@ -47,6 +47,46 @@ class VectorIndexTracker:
     def get_indexed_ids_key(self, dataset_name: str) -> str:
         return f"indexed_ids_{dataset_name}.json"
 
+    def initialize_next_id(self, dataset_name: str, next_id: int):
+        """Initialize the next available ID counter in DynamoDB for a dataset."""
+        try:
+            self.table.put_item(Item={
+                "centroid_id": "ID_TRACKER",
+                "sk": dataset_name,
+                "next_id": next_id,
+                "dataset": dataset_name
+            })
+            print(f"Initialized next_id={next_id} for dataset '{dataset_name}' in DynamoDB")
+        except Exception as e:
+            print(f"Error initializing next_id in DynamoDB: {e}")
+
+    def get_next_id_atomic(self, dataset_name: str, count: int) -> int:
+        """Atomically get and reserve the next `count` IDs. Returns the starting ID."""
+        try:
+            response = self.table.update_item(
+                Key={"centroid_id": "ID_TRACKER", "sk": dataset_name},
+                UpdateExpression="SET next_id = if_not_exists(next_id, :zero) + :inc",
+                ExpressionAttributeValues={":inc": count, ":zero": 0},
+                ReturnValues="ALL_NEW"
+            )
+            # Return the starting ID (value after increment minus count)
+            return response["Attributes"]["next_id"] - count
+        except Exception as e:
+            print(f"Error getting next ID atomically: {e}")
+            raise
+
+    def get_next_id(self, dataset_name: str) -> int:
+        """Get the next available ID from DynamoDB counter."""
+        try:
+            response = self.table.get_item(
+                Key={"centroid_id": "ID_TRACKER", "sk": dataset_name}
+            )
+            item = response.get("Item", {})
+            return item.get("next_id", 0)
+        except Exception as e:
+            print(f"Error reading next_id from DynamoDB: {e}")
+            return 0
+
     def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], create_file: bool = True) -> str:
         if not vectors:
             return None
@@ -164,6 +204,14 @@ class VectorIndexTracker:
         self.create_indexed_tracking(dataset_name, list(existing))
 
     def get_indexed_ids(self, dataset_name: str) -> Set[int]:
+        # Try DynamoDB counter first for total count, fall back to S3 for actual IDs
+        next_id = self.get_next_id(dataset_name)
+        if next_id > 0:
+            # Return a set with just the count info (for len() to work)
+            # This is a hack for backward compatibility with status command
+            return set(range(next_id))
+        
+        # Fall back to S3
         indexed_key = self.get_indexed_ids_key(dataset_name)
         try:
             obj = self.s3.get_object(Bucket=self.bucket, Key=indexed_key)

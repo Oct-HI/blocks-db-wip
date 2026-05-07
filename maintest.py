@@ -59,11 +59,11 @@ def main():
     print("\n" + "=" * 50)
     print("3. Upload data and index")
     print("=" * 50)
-    run(f"upload-data {DATASET} {CSV_PATH} --config {CONFIG_PATH} --workers 16")
+    run(f"initialize-database {DATASET} {CSV_PATH} --config {CONFIG_PATH} --workers 16")
 
     # ── Status ───────────────────────────────────────
     print("\n" + "=" * 50)
-    print("4. Status (after upload-data)")
+    print("4. Status (after initialize-database)")
     print("=" * 50)
     run(f"status {DATASET} -v")
 

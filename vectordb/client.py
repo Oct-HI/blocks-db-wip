@@ -1,3 +1,4 @@
+import json
 import os
 import boto3
 import numpy as np
@@ -93,6 +94,10 @@ class VectorDBClient:
     def get_indexed_ids(self, dataset_name: str) -> set:
         """Get all indexed vector IDs."""
         return self.tracker.get_indexed_ids(dataset_name)
+
+    def get_indexed_count(self, dataset_name: str) -> int:
+        """Get count of indexed vectors from DynamoDB counter."""
+        return self.tracker.get_next_id(dataset_name)
 
     def mark_vectors_indexed(self, dataset_name: str, indexed_ids: List[int]):
         """Mark vectors as indexed (called after reindex)."""
@@ -316,22 +321,71 @@ class VectorDBClient:
         print(f"Marked {len(pending_ids)} pending vectors as indexed for hybrid search.")
 
     def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int):
-        """Read the main CSV and track all vectors as indexed."""
+        """Read the main CSV and track all vectors as indexed + build csv_blocks for optimized get."""
         key = f"vectors_{dataset_name}.csv"
         indexed_ids = []
-        
+        block_size = 500000  # ~500KB per block
+        blocks = []
+
         try:
+            head = self.s3.head_object(Bucket=self.bucket, Key=key)
+        except Exception as e:
+            print(f"Warning: Could not get CSV metadata: {e}")
+            return
+
+        try:
+            current_offset = 0
+            current_block_start_id = None
+            current_block_size = 0
+            last_vid = None
+
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
             for raw_line in obj["Body"].iter_lines():
                 if not raw_line:
                     continue
                 line = raw_line.decode()
                 id_str = line.split(",")[0]
-                indexed_ids.append(int(id_str))
-            
+                vec_id = int(id_str)
+                indexed_ids.append(vec_id)
+
+                if current_block_start_id is None:
+                    current_block_start_id = vec_id
+
+                current_block_size += len(raw_line) + 1
+
+                if current_block_size >= block_size:
+                    blocks.append({
+                        "start_id": current_block_start_id,
+                        "end_id": vec_id,
+                        "offset": current_offset,
+                        "size": current_block_size
+                    })
+                    current_offset += current_block_size
+                    current_block_start_id = None
+                    current_block_size = 0
+
+                last_vid = vec_id
+
+            if current_block_start_id is not None and last_vid is not None:
+                blocks.append({
+                    "start_id": current_block_start_id,
+                    "end_id": last_vid,
+                    "offset": current_offset,
+                    "size": current_block_size
+                })
+
+            if blocks:
+                blocks_key = f"csv_blocks_{dataset_name}.json"
+                self.s3.put_object(Bucket=self.bucket, Key=blocks_key, Body=json.dumps(blocks))
+                print(f"Built {len(blocks)} CSV blocks for optimized get.")
+
             if indexed_ids:
                 self.tracker.create_indexed_tracking(dataset_name, indexed_ids)
+                # Initialize DynamoDB counter for atomic ID tracking
+                next_id = max(indexed_ids) + 1
+                self.tracker.initialize_next_id(dataset_name, next_id)
                 print(f"Tracked {len(indexed_ids)} vectors as indexed.")
+                print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
         except Exception as e:
             print(f"Warning: Could not track indexed vectors: {e}")
 

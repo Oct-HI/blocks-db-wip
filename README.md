@@ -17,7 +17,7 @@ Blocks-DB is a modular serverless vector database built on Lithops and AWS Lambd
 
 ```bash
 # Clone the repository
-git clone [github.com/Oct-HI/blocks-db-wip/] (https://github.com/Oct-HI/blocks-db-wip)
+git clone https://github.com/Oct-HI/blocks-db-wip
 cd blocks-db
 
 # (Optional) Create virtual environment
@@ -86,10 +86,10 @@ blocks-db setup --bucket your-s3-bucket \
 
 > **Warning:** Ensure these resources do not already exist, or the setup will fail or update existing resources.
 
-### Upload data and index
+### Initialize database
 
 ```bash
-blocks-db upload-data mydataset vectors.csv --config config.json --workers 16
+blocks-db initialize-database mydataset vectors.csv --config config.json --workers 16
 ```
 
 This requires an **index config file**. Example (`config.json`):
@@ -142,10 +142,10 @@ This requires an **index config file**. Example (`config.json`):
 
 To skip auto-update threshold:
 ```bash
-blocks-db upload-data mydataset vectors.csv --config config.json --no-update-threshold
+blocks-db initialize-database mydataset vectors.csv --config config.json --no-update-threshold
 ```
 
-After upload-data, the threshold is automatically configured based on the initial config (num_index, features) and estimated vector size. This threshold controls the size of each block for auto-indexing — the system tries to get as close as possible to this size.
+After initializing, the threshold is automatically configured based on the initial config (num_index, features) and estimated vector size. This threshold controls the size of each block for auto-indexing — the system tries to get as close as possible to this size.
 
 ### Add more vectors
 
@@ -155,7 +155,7 @@ blocks-db put mydataset new_vectors.csv
 
 Vectors are stored as "pending" and included in searches automatically.
 
-### Update threshold (after upload-data)
+### Update threshold (after initialize-database)
 
 If you used `--no-update-threshold` or want to adjust manually:
 
@@ -189,6 +189,35 @@ blocks-db status mydataset
 
 # With details
 blocks-db status mydataset -v
+```
+
+---
+
+## Commands Reference
+
+| Command | Description | Usage |
+|---------|-------------|-------|
+| `setup` | Create infrastructure (Lambda, DynamoDB, S3 triggers) | `blocks-db setup --bucket <bucket>` |
+| `configure` | Save default bucket and region | `blocks-db configure --bucket <bucket> --region us-east-1` |
+| `refresh-credentials` | Refresh AWS credentials in Lithops config | `blocks-db refresh-credentials` |
+| `update-threshold` | Update auto-indexer block size threshold | `blocks-db update-threshold [bytes] --dataset <name>` |
+| `initialize-database` | Upload dataset and build initial index | `blocks-db initialize-database <name> <csv> --config <json>` |
+| `put` | Add vectors to pending storage | `blocks-db put <name> <csv>` |
+| `query` | Search vectors (indexed + pending by default) | `blocks-db query <name> --file <csv> --k 10` |
+| `status` | Show dataset status and index info | `blocks-db status <name> [-v]` |
+| `get` | Retrieve vectors by ID, list vectors, or show pending | `blocks-db get <name> <id>... [--limit N] [--pending]` |
+
+### `get` command usage
+
+```bash
+# Get specific vectors by ID
+blocks-db get mydataset 1 2 3
+
+# List first N vectors from dataset
+blocks-db get mydataset --limit 100
+
+# Show pending vectors
+blocks-db get mydataset --pending
 ```
 
 ---
@@ -253,27 +282,3 @@ Blocks-DB needs the following permissions (created automatically by `setup`):
 - Auto-indexer Lambda triggers when you upload CSV to `pending/` in S3
 - Default search is hybrid (index + pending)
 - Use `--indexed-only` to search only the existing index
-
----
-
-## Additional Commands
-
-These commands are available but not covered in detail above:
-
-```bash
-blocks-db refresh-credentials     # Refresh AWS credentials in Lithops config
-blocks-db update-threshold       # Update auto-indexer threshold (auto after upload-data)
-blocks-db config save <dataset> <config.json>  # Save index config for dataset
-blocks-db config delete <dataset>             # Delete index config
-```
-
----
-
-## Pending Upgrades
-
-These features are planned for future versions:
-
-```bash
-blocks-db get <dataset> <id>...    # Get vectors by ID
-blocks-db list vectors <dataset>   # List vectors in dataset
-```

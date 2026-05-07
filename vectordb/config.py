@@ -10,8 +10,6 @@ class InfraConfig:
     lambda_role_name: str = "blocksdb-autoindexer-role-default"
     dynamodb_table_name: str = "BlocksDB-default"
     layer_name: str = "blocksdb-layer-faiss-default"
-    # TODO: No longer used - CloudFormation not used in setup
-    stack_name: str = "blocksdb-stack-default"
     threshold_size_bytes: int = 5242880  # 5 MB
     runtime_name: str = "blocks-db-runtime"
 
