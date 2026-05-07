@@ -1,10 +1,26 @@
+<div align="center">
+
 # Blocks-DB: Serverless Vector Database
+
+<p>
+  <img src="https://img.shields.io/badge/🐍Python-3.10-4ecdc4?style=for-the-badge&logo=python&logoColor=white">
+  <img src="https://img.shields.io/github/stars/Oct-HI/blocks-db-wip?style=for-the-badge&logo=github&logoColor=white">
+  <a href="https://doi.org/10.1145/3769769"><img src="https://img.shields.io/badge/📄Paper-10.1145/3769769-ff6b6b?style=for-the-badge"></a>
+</p>
+
+<div align="center" style="margin: 30px 0;">
+  <img src="./README.assets/blocks-db-scheme.png" width="800" alt="Blocks-DB Scheme">
+</div>
+
+</div>
+
+---
 
 Blocks-DB is a modular serverless vector database built on Lithops and AWS Lambda. It supports block-based indexing with FAISS, distributed querying, and a simple CLI or Python client interface.
 
 ---
 
-## Requirements
+## 📋 Requirements
 
 - **Python 3.10** (venv use recommended)
 - **Docker** & **Docker Hub account**
@@ -13,7 +29,7 @@ Blocks-DB is a modular serverless vector database built on Lithops and AWS Lambd
 
 ---
 
-## Installation
+## 📦 Installation
 
 ```bash
 # Clone the repository
@@ -30,7 +46,7 @@ pip install .
 
 ---
 
-## Initial Setup
+## ⚙️ Initial Setup
 
 ### 1. Configure AWS credentials
 
@@ -58,7 +74,7 @@ This saves configuration to `~/.blocks-db-config/backend_config.json`.
 
 ---
 
-## Quick Start
+## 🏃 Quick Start
 
 ### Setup: Create infrastructure
 
@@ -193,7 +209,7 @@ blocks-db status mydataset -v
 
 ---
 
-## Commands Reference
+## 📖 Commands Reference
 
 | Command | Description | Usage |
 |---------|-------------|-------|
@@ -222,7 +238,7 @@ blocks-db get mydataset --pending
 
 ---
 
-## File Formats
+## 📄 File Formats
 
 ### Vectors CSV
 
@@ -235,7 +251,7 @@ First column: ID (integer), rest: space-separated values.
 
 ---
 
-## S3 Structure
+## 🗂️ S3 Structure
 
 ```
 your-bucket/
@@ -251,7 +267,7 @@ your-bucket/
 
 ---
 
-## Python Client
+## 🐍 Python Client
 
 ```python
 from blocks_db.client import VectorDBClient
@@ -265,7 +281,7 @@ results, times = client.query("mydataset", vector)
 
 ---
 
-## AWS Permissions
+## 🔐 AWS Permissions
 
 Blocks-DB needs the following permissions (created automatically by `setup`):
 
@@ -277,8 +293,17 @@ Blocks-DB needs the following permissions (created automatically by `setup`):
 
 ---
 
-## Notes
+## 📝 Notes
 
 - Auto-indexer Lambda triggers when you upload CSV to `pending/` in S3
 - Default search is hybrid (index + pending)
 - Use `--indexed-only` to search only the existing index
+
+---
+
+## 📖 Citation
+
+Based on: *Building Stateless Serverless Vector DBs via Block-based Data Partitioning*  
+Daniel Barcelona-Pons, Raúl Gracia-Tinedo, Albert Cañadilla-Domingo, Xavier Roca-Canals, Pedro García-López  
+Proc. ACM Manag. Data 3, 6 (SIGMOD), Article 304 (December 2025)  
+DOI: [10.1145/3769769](https://doi.org/10.1145/3769769)
