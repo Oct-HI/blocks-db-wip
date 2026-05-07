@@ -9,7 +9,7 @@
 </p>
 
 <div align="center" style="margin: 30px 0;">
-  <img src="./README.assets/blocks-db-scheme.png" width="800" alt="Blocks-DB Scheme">
+  <img src="./README.assets/blocks-db-scheme.png" alt="Blocks-DB Scheme" style="max-width: 100%; height: auto;">
 </div>
 
 </div>
