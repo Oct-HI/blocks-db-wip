@@ -1,10 +1,26 @@
+<div align="center">
+
 # Blocks-DB: Serverless Vector Database
+
+<p>
+  <img src="https://img.shields.io/badge/🐍Python-3.10-4ecdc4?style=for-the-badge&logo=python&logoColor=white">
+  <img src="https://img.shields.io/github/stars/Oct-HI/blocks-db-wip?style=for-the-badge&logo=github&logoColor=white">
+  <a href="https://doi.org/10.1145/3769769"><img src="https://img.shields.io/badge/📄Paper-10.1145/3769769-ff6b6b?style=for-the-badge"></a>
+</p>
+
+<div align="center" style="margin: 30px 0;">
+  <img src="./README.assets/blocks-db-scheme.png" alt="Blocks-DB Scheme" style="max-width: 100%; height: auto;">
+</div>
+
+</div>
+
+---
 
 Blocks-DB is a modular serverless vector database built on Lithops and AWS Lambda. It supports block-based indexing with FAISS, distributed querying, and a simple CLI or Python client interface.
 
 ---
 
-## Requirements
+## 📋 Requirements
 
 - **Python 3.10** (venv use recommended)
 - **Docker** & **Docker Hub account**
@@ -13,11 +29,11 @@ Blocks-DB is a modular serverless vector database built on Lithops and AWS Lambd
 
 ---
 
-## Installation
+## 📦 Installation
 
 ```bash
 # Clone the repository
-git clone [github.com/Oct-HI/blocks-db-wip/] (https://github.com/Oct-HI/blocks-db-wip)
+git clone https://github.com/Oct-HI/blocks-db-wip
 cd blocks-db
 
 # (Optional) Create virtual environment
@@ -30,7 +46,7 @@ pip install .
 
 ---
 
-## Initial Setup
+## ⚙️ Initial Setup
 
 ### 1. Configure AWS credentials
 
@@ -58,7 +74,7 @@ This saves configuration to `~/.blocks-db-config/backend_config.json`.
 
 ---
 
-## Quick Start
+## 🏃 Quick Start
 
 ### Setup: Create infrastructure
 
@@ -86,10 +102,10 @@ blocks-db setup --bucket your-s3-bucket \
 
 > **Warning:** Ensure these resources do not already exist, or the setup will fail or update existing resources.
 
-### Upload data and index
+### Initialize database
 
 ```bash
-blocks-db upload-data mydataset vectors.csv --config config.json --workers 16
+blocks-db initialize-database mydataset vectors.csv --config config.json --workers 16
 ```
 
 This requires an **index config file**. Example (`config.json`):
@@ -142,10 +158,10 @@ This requires an **index config file**. Example (`config.json`):
 
 To skip auto-update threshold:
 ```bash
-blocks-db upload-data mydataset vectors.csv --config config.json --no-update-threshold
+blocks-db initialize-database mydataset vectors.csv --config config.json --no-update-threshold
 ```
 
-After upload-data, the threshold is automatically configured based on the initial config (num_index, features) and estimated vector size. This threshold controls the size of each block for auto-indexing — the system tries to get as close as possible to this size.
+After initializing, the threshold is automatically configured based on the initial config (num_index, features) and estimated vector size. This threshold controls the size of each block for auto-indexing — the system tries to get as close as possible to this size.
 
 ### Add more vectors
 
@@ -155,7 +171,7 @@ blocks-db put mydataset new_vectors.csv
 
 Vectors are stored as "pending" and included in searches automatically.
 
-### Update threshold (after upload-data)
+### Update threshold (after initialize-database)
 
 If you used `--no-update-threshold` or want to adjust manually:
 
@@ -193,7 +209,36 @@ blocks-db status mydataset -v
 
 ---
 
-## File Formats
+## 📖 Commands Reference
+
+| Command | Description | Usage |
+|---------|-------------|-------|
+| `setup` | Create infrastructure (Lambda, DynamoDB, S3 triggers) | `blocks-db setup --bucket <bucket>` |
+| `configure` | Save default bucket and region | `blocks-db configure --bucket <bucket> --region us-east-1` |
+| `refresh-credentials` | Refresh AWS credentials in Lithops config | `blocks-db refresh-credentials` |
+| `update-threshold` | Update auto-indexer block size threshold | `blocks-db update-threshold [bytes] --dataset <name>` |
+| `initialize-database` | Upload dataset and build initial index | `blocks-db initialize-database <name> <csv> --config <json>` |
+| `put` | Add vectors to pending storage | `blocks-db put <name> <csv>` |
+| `query` | Search vectors (indexed + pending by default) | `blocks-db query <name> --file <csv> --k 10` |
+| `status` | Show dataset status and index info | `blocks-db status <name> [-v]` |
+| `get` | Retrieve vectors by ID, list vectors, or show pending | `blocks-db get <name> <id>... [--limit N] [--pending]` |
+
+### `get` command usage
+
+```bash
+# Get specific vectors by ID
+blocks-db get mydataset 1 2 3
+
+# List first N vectors from dataset
+blocks-db get mydataset --limit 100
+
+# Show pending vectors
+blocks-db get mydataset --pending
+```
+
+---
+
+## 📄 File Formats
 
 ### Vectors CSV
 
@@ -206,7 +251,7 @@ First column: ID (integer), rest: space-separated values.
 
 ---
 
-## S3 Structure
+## 🗂️ S3 Structure
 
 ```
 your-bucket/
@@ -222,7 +267,7 @@ your-bucket/
 
 ---
 
-## Python Client
+## 🐍 Python Client
 
 ```python
 from blocks_db.client import VectorDBClient
@@ -236,7 +281,7 @@ results, times = client.query("mydataset", vector)
 
 ---
 
-## AWS Permissions
+## 🔐 AWS Permissions
 
 Blocks-DB needs the following permissions (created automatically by `setup`):
 
@@ -248,7 +293,7 @@ Blocks-DB needs the following permissions (created automatically by `setup`):
 
 ---
 
-## Notes
+## 📝 Notes
 
 - Auto-indexer Lambda triggers when you upload CSV to `pending/` in S3
 - Default search is hybrid (index + pending)
@@ -256,24 +301,9 @@ Blocks-DB needs the following permissions (created automatically by `setup`):
 
 ---
 
-## Additional Commands
+## 📖 Citation
 
-These commands are available but not covered in detail above:
-
-```bash
-blocks-db refresh-credentials     # Refresh AWS credentials in Lithops config
-blocks-db update-threshold       # Update auto-indexer threshold (auto after upload-data)
-blocks-db config save <dataset> <config.json>  # Save index config for dataset
-blocks-db config delete <dataset>             # Delete index config
-```
-
----
-
-## Pending Upgrades
-
-These features are planned for future versions:
-
-```bash
-blocks-db get <dataset> <id>...    # Get vectors by ID
-blocks-db list vectors <dataset>   # List vectors in dataset
-```
+Based on: *Building Stateless Serverless Vector DBs via Block-based Data Partitioning*  
+Daniel Barcelona-Pons, Raúl Gracia-Tinedo, Albert Cañadilla-Domingo, Xavier Roca-Canals, Pedro García-López  
+Proc. ACM Manag. Data 3, 6 (SIGMOD), Article 304 (December 2025)  
+DOI: [10.1145/3769769](https://doi.org/10.1145/3769769)

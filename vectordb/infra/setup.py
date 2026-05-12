@@ -394,8 +394,7 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
         build_runtime: Build and push Lithops runtime (default: True)
     """
     config = get_infra_config(overrides=config_overrides)
-    
-    stack_name = config.get("stack_name")
+
     lambda_function_name = config.get("lambda_function_name")
     runtime_name = config.get("runtime_name")
     threshold_bytes = config.get("threshold_size_bytes")
@@ -425,7 +424,6 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     
     print(f"\nSetting up Blocks-DB infrastructure...")
     print(f"  S3 Bucket: {s3_bucket}")
-    print(f"  Stack: {stack_name}")
     print(f"  Region: {region}")
 
     lambda_arn = None
@@ -505,7 +503,7 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     print(f"\n✓ Setup complete!")
     print(f"\nNext steps:")
     print(f"  1. blocks-db configure --bucket {s3_bucket} --region {region}")
-    print(f"  2. blocks-db upload-data mydata vectors.csv --config config.json")
+    print(f"  2. blocks-db initialize-database mydata vectors.csv --config config.json")
     print(f"  3. blocks-db put mydata new_vectors.csv  (add more vectors)")
     print(f"  4. blocks-db query mydata --file queries.csv  (search)")
 
@@ -592,7 +590,6 @@ def create_lambda_manually(s3_bucket, layer_arn=None, function_name=None):
         'Environment': {
             'Variables': {
                 'DYNAMODB_TABLE': dynamodb_table,
-                'STORAGE_BUCKET': s3_bucket,
                 'THRESHOLD_SIZE_BYTES': str(threshold_bytes)
             }
         }
@@ -683,7 +680,6 @@ def create_lambda_from_image(s3_bucket, image_uri, function_name=None):
             Environment={
                 'Variables': {
                     'DYNAMODB_TABLE': dynamodb_table,
-                    'STORAGE_BUCKET': s3_bucket,
                     'THRESHOLD_SIZE_BYTES': str(threshold_bytes)
                 }
             }
@@ -696,7 +692,7 @@ def create_lambda_from_image(s3_bucket, image_uri, function_name=None):
         return response['FunctionArn']
 
 
-def create_lambda_with_code_and_layer(s3_bucket, layer_arn=None, function_name=None, threshold_bytes=None, starting_index=0):
+def create_lambda_with_code_and_layer(s3_bucket, layer_arn=None, function_name=None, threshold_bytes=None):
     """Create Lambda function with code zip file and attach a layer."""
     import zipfile
     from io import BytesIO
@@ -777,10 +773,8 @@ def create_lambda_with_code_and_layer(s3_bucket, layer_arn=None, function_name=N
         'Environment': {
             'Variables': {
                 'DYNAMODB_TABLE': dynamodb_table,
-                'STORAGE_BUCKET': s3_bucket,
                 'THRESHOLD_SIZE_BYTES': str(threshold_bytes),
-                'INDEX_IMPLEMENTATION': 'blocks',
-                'STARTING_INDEX': str(starting_index)
+                'INDEX_IMPLEMENTATION': 'blocks'
             }
         }
     }
@@ -882,54 +876,6 @@ def deploy_lambda_code(function_name=None):
         return None
 
 
-def quick_deploy_lambda(s3_bucket, overrides=None, starting_index=0):
-    """
-    Quick deploy: create/update Lambda layer + Lambda function with code.
-    No CloudFormation or S3 bucket setup needed.
-    
-    Args:
-        s3_bucket: S3 bucket for storage
-        overrides: Optional dict to override config values (e.g. {"threshold_size_bytes": 16})
-        starting_index: Starting index number for auto-indexer
-    """
-    config = get_infra_config(overrides=overrides)
-    function_name = config.get("lambda_function_name")
-    threshold_bytes = config.get("threshold_size_bytes")
-    
-    print(f"\n=== Quick Deploy Lambda ===")
-    print(f"  Function: {function_name}")
-    print(f"  Bucket: {s3_bucket}")
-    print(f"  Threshold: {threshold_bytes:,} bytes")
-    print(f"  Starting Index: {starting_index}")
-    
-    print("\n1. Creating/updating Lambda layer...")
-    layer_arn = create_faiss_lambda_layer()
-    if not layer_arn:
-        print("  ERROR: Failed to create layer")
-        return None
-    print(f"  ✓ Layer ready: {layer_arn}")
-    
-    print("\n2. Creating/updating Lambda function...")
-    lambda_arn = create_lambda_with_code_and_layer(s3_bucket, layer_arn, function_name, threshold_bytes, starting_index)
-    if not lambda_arn:
-        print("  ERROR: Failed to create/update Lambda")
-        return None
-    print(f"  ✓ Lambda ready: {lambda_arn}")
-    
-    print("\n3. Configuring S3 trigger...")
-    try:
-        configure_s3_notification(s3_bucket, lambda_arn, function_name)
-        print("  ✓ S3 trigger configured")
-    except Exception as e:
-        print(f"  Warning: {e}")
-    
-    print(f"\n=== Deploy Complete ===")
-    print(f"  Lambda: {function_name}")
-    print(f"  Layer: {layer_arn.split(':')[-1]}")
-    print(f"  Update code anytime with: blocks-db deploy-lambda")
-    print(f"  Update threshold with: blocks-db update-threshold <mb>")
-    
-    return lambda_arn
 
 
 def configure_s3_notification(s3_bucket, lambda_arn, function_name=None):

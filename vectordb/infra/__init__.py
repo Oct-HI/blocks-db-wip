@@ -6,8 +6,6 @@ from .setup import (
     create_faiss_lambda_layer,
     deploy_lambda_code,
     create_lambda_with_code_and_layer,
-    quick_deploy_lambda,
-    configure_s3_notification,
     get_infra_config,
 )
 
@@ -19,6 +17,5 @@ __all__ = [
     "create_faiss_lambda_layer",
     "deploy_lambda_code",
     "create_lambda_with_code_and_layer",
-    "quick_deploy_lambda",
-    "configure_s3_notification",
+    "get_infra_config",
 ]
