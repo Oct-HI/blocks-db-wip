@@ -127,6 +127,11 @@ def main():
     if args.command not in commands_without_bucket:
         client = VectorDBClient(bucket=bucket, region=region)
 
+    def _fmt_result(r):
+        if len(r) == 3:
+            return f"(id={r[0]}, dist={r[1]:.4f}, src={r[2]})"
+        return str(r)
+
     # ── setup ────────────────────────────────────────────────
     if args.command == "setup":
         overrides = {}
@@ -244,14 +249,14 @@ def main():
             vector = [float(x) for x in args.vector.split()]
             results, times = client.query(args.name, vector, k=args.k, hybrid=hybrid)
             print(f"Query: {vector[:5]}...")
-            print(f"Results: {results[:args.k]}")
+            print(f"Results: {[_fmt_result(r) for r in results[:args.k]]}")
         elif args.file:
             if not os.path.exists(args.file):
                 raise FileNotFoundError(args.file)
             results, times = client.query_from_file(args.name, args.file, hybrid=hybrid, k=args.k)
             print(f"Results ({len(results)} queries):")
             for i, res in enumerate(results[:5]):
-                print(f"  Query {i}: {res[:args.k]}")
+                print(f"  Query {i}: {[_fmt_result(r) for r in res[:args.k]]}")
             if len(results) > 5:
                 print(f"  ... and {len(results) - 5} more queries")
 

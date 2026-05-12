@@ -24,7 +24,7 @@ from .utils.index_ops import (
 )
 
 from .utils.vector_tracking import VectorIndexTracker
-from .utils.hybrid_search import brute_force_search, merge_search_results
+
 
 from .serverless_vectordb import ServerlessVectorDB
 from .infra import refresh_lithops_credentials
@@ -501,35 +501,30 @@ class VectorDBClient:
     def _query_hybrid(self, dataset_name: str, vectors_np: np.ndarray, k: int = None):
         """Internal hybrid query implementation."""
         k = k if k is not None else self._get_k_result(dataset_name)
-        
-        indexed_results = None
-        indexed_times = None
-        
+
         try:
             sv_vectordb = self._load_default_index(dataset_name)
-            indexed_results, indexed_times = sv_vectordb.search(0, vectors_np)
-        except ValueError as e:
-            print(f"No index available: {e}")
-            indexed_results = [[] for _ in range(len(vectors_np))]
-            indexed_times = {"error": str(e)}
-        
-        unindexed_results = None
-        
-        if self.has_pending_vectors(dataset_name):
+            results, times = sv_vectordb.search(0, vectors_np)
+        except ValueError:
+            results = None
+            times = {"error": "no index available"}
+
+        if results is None and self.has_pending_vectors(dataset_name):
+            from .utils.hybrid_search import brute_force_search
             unindexed = self.get_pending_vectors(dataset_name)
             if unindexed:
-                unindexed_results = brute_force_search(vectors_np, unindexed, k)
-        
-        if unindexed_results is None:
-            merged = indexed_results
-        else:
-            merged = merge_search_results(indexed_results, unindexed_results, k)
-        
-        times = indexed_times if indexed_times else {}
+                results = brute_force_search(vectors_np, unindexed, k)
+                for r in results:
+                    r[:] = [(vid, dist, "pending") for vid, dist in r]
+                times = {"fallback": "no index, searched pending only"}
+
+        if results is None:
+            results = [[] for _ in range(len(vectors_np))]
+
         times["hybrid_search"] = True
-        times["has_unindexed"] = unindexed_results is not None
-        
-        return merged, times
+        times["has_pending"] = self.has_pending_vectors(dataset_name)
+
+        return results, times
     
     def query_from_file(self, dataset_name: str, csv_path: str, hybrid: bool = True, k: int = None):
         """
@@ -582,40 +577,6 @@ class VectorDBClient:
             Merged search results with (id, distance) tuples
         """
         return self.query_batch(dataset_name, vectors, k=k, hybrid=True)
-
-    def _query_hybrid(self, dataset_name: str, vectors_np: np.ndarray, k: int = None):
-        """Internal hybrid query implementation."""
-        k = k if k is not None else self._get_k_result(dataset_name)
-        
-        indexed_results = None
-        indexed_times = None
-        
-        try:
-            sv_vectordb = self._load_default_index(dataset_name)
-            indexed_results, indexed_times = sv_vectordb.search(0, vectors_np)
-        except ValueError as e:
-            print(f"No index available: {e}")
-            indexed_results = [[] for _ in range(len(vectors_np))]
-            indexed_times = {}
-        
-        unindexed_results = None
-        unindexed_times = {}
-        
-        if self.has_pending_vectors(dataset_name):
-            unindexed = self.get_pending_vectors(dataset_name)
-            if unindexed:
-                unindexed_results = brute_force_search(vectors_np, unindexed, k)
-        
-        if unindexed_results is None:
-            merged = indexed_results
-        else:
-            merged = merge_search_results(indexed_results, unindexed_results, k)
-        
-        times = indexed_times if indexed_times else {}
-        times["hybrid_search"] = True
-        times["has_unindexed"] = unindexed_results is not None
-        
-        return merged, times
 
     def _get_k_result(self, dataset_name: str) -> int:
         """Get k_result from index config."""

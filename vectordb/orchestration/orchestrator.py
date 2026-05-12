@@ -85,7 +85,7 @@ class Orchestrator:
             body=orjson.dumps(queries.tolist())
         )
 
-        index_to_compute = self.query_strategy.create_map_tasks(queries_key, self.config)
+        index_to_compute = self.query_strategy.create_map_tasks(queries_key, self.config, storage=self.function_executor.storage)
 
         create_map_data = time.time()
 
