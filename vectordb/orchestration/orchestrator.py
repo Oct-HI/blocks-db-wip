@@ -71,7 +71,7 @@ class Orchestrator:
             times.append(res[1])
         return results, times
 
-    def search(self, id_query, queries, n=None, k_search=None, k_result=None):
+    def search(self, id_query, queries, n=None, k_search=None, k_result=None, filter_tags=None):
         n        = n        if n        is not None else len(queries)
         k_search = k_search if k_search is not None else self.config.k_search
         k_result = k_result if k_result is not None else self.config.k_result
@@ -85,7 +85,7 @@ class Orchestrator:
             body=orjson.dumps(queries.tolist())
         )
 
-        index_to_compute = self.query_strategy.create_map_tasks(queries_key, self.config, storage=self.function_executor.storage)
+        index_to_compute = self.query_strategy.create_map_tasks(queries_key, self.config, storage=self.function_executor.storage, filter_tags=filter_tags)
 
         create_map_data = time.time()
 

@@ -7,6 +7,7 @@ import tempfile
 import os
 import csv
 import io
+import json
 import time
 
 from .s3_client import s3
@@ -87,7 +88,7 @@ class VectorIndexTracker:
             print(f"Error reading next_id from DynamoDB: {e}")
             return 0
 
-    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], create_file: bool = True) -> str:
+    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], create_file: bool = True, tags: dict = None) -> str:
         if not vectors:
             return None
         file_id = str(int(time.time() * 1000))
@@ -101,26 +102,32 @@ class VectorIndexTracker:
             writer.writerow([vec_id, vec_str])
         csv_bytes = csv_buffer.getvalue().encode("utf-8")
 
-        s3.put_object(Bucket=self.bucket, Key=key, Body=csv_bytes)
+        extra_args = {}
+        if tags:
+            extra_args["Metadata"] = {"tags": json.dumps(tags)}
+        s3.put_object(Bucket=self.bucket, Key=key, Body=csv_bytes, **extra_args)
         
         new_ids = [v[0] for v in vectors]
-        self._update_pending_tracking(dataset_name, new_ids, key)
+        self._update_pending_tracking(dataset_name, new_ids, key, tags)
         
         return key
 
-    def put_vector(self, dataset_name: str, vector_id: int, vector: List[float]) -> str:
-        return self.put_vectors(dataset_name, [(vector_id, vector)])
+    def put_vector(self, dataset_name: str, vector_id: int, vector: List[float], tags: dict = None) -> str:
+        return self.put_vectors(dataset_name, [(vector_id, vector)], tags=tags)
 
-    def _update_pending_tracking(self, dataset_name: str, vector_ids: List[int], file_key: str):
+    def _update_pending_tracking(self, dataset_name: str, vector_ids: List[int], file_key: str, tags: dict = None):
         try:
-            self.table.put_item(Item={
+            item = {
                 "centroid_id": "PENDING",
                 "sk": f"FILE#{file_key}",
                 "dataset": dataset_name,
                 "file_key": file_key,
                 "vector_ids": vector_ids[:1000] if vector_ids else [],
                 "timestamp": int(time.time())
-            })
+            }
+            if tags:
+                item["tags"] = json.dumps(tags)
+            self.table.put_item(Item=item)
         except Exception as e:
             print(f"DynamoDB tracking error (non-fatal): {e}")
 

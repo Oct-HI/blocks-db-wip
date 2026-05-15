@@ -73,6 +73,7 @@ def main():
     put_parser.add_argument("name", help="Dataset name")
     put_parser.add_argument("csv_path", help="CSV file with vectors (id, vector values)")
     put_parser.add_argument("--single", action="store_true", help="Treat as single vector per file (one vector per file)")
+    put_parser.add_argument("--tags", type=str, default=None, help='JSON dict of tags (e.g. \'{"source":"web","category":"news"}\')')
 
     # ── query ─────────────────────────────────────────────────
     query_parser = subparsers.add_parser("query", help="Query vectors (searches indexed + pending)")
@@ -82,6 +83,8 @@ def main():
     query_group.add_argument("--file", help="CSV file with query vectors")
     query_parser.add_argument("--k", type=int, default=10, help="Number of results")
     query_parser.add_argument("--indexed-only", action="store_true", help="Search only indexed vectors (skip pending)")
+    query_parser.add_argument("--batch-size", type=int, default=None, help="Override query_batch_size (centroid .ann per map worker)")
+    query_parser.add_argument("--filter", type=str, default=None, help='JSON dict of tag filters (e.g. \'{"source":"web"}\'), AND semantics, only centroids/pending matching ALL tags are searched')
 
     # ── status ────────────────────────────────────────────────
     status_parser = subparsers.add_parser("status", help="Show dataset status")
@@ -207,6 +210,10 @@ def main():
     elif args.command == "put":
         from .utils.vector_utils import load_vectors_with_ids_from_csv, load_vectors_from_csv
 
+        tags = json.loads(args.tags) if args.tags else None
+        if tags:
+            print(f"Tags: {tags}")
+
         print(f"\n=== Putting vectors into '{args.name}' ===")
 
         if args.single:
@@ -218,7 +225,7 @@ def main():
                     try:
                         vec_id = int(row[0])
                         vec = [float(x) for x in row[1].strip().split() if x]
-                        key = client.tracker.put_vector(args.name, vec_id, vec)
+                        key = client.tracker.put_vector(args.name, vec_id, vec, tags=tags)
                         print(f"  Uploaded vector {vec_id} -> {key}")
                     except (ValueError, IndexError) as e:
                         print(f"  Skipping invalid line: {row} ({e})")
@@ -231,10 +238,10 @@ def main():
 
             if len(vectors) == 1:
                 vec_id, vec = vectors[0]
-                key = client.tracker.put_vector(args.name, vec_id, vec)
+                key = client.tracker.put_vector(args.name, vec_id, vec, tags=tags)
                 print(f"Uploaded 1 vector -> {key}")
             else:
-                key = client.tracker.put_vectors(args.name, vectors)
+                key = client.tracker.put_vectors(args.name, vectors, tags=tags)
                 print(f"Uploaded {len(vectors)} vectors -> {key}")
 
         print(f"\nVectors added to pending. Use 'blocks-db query {args.name}' to search them.")
@@ -244,23 +251,30 @@ def main():
         print(f"\n=== Querying '{args.name}' ===")
 
         hybrid = not args.indexed_only
+        filter_tags = json.loads(args.filter) if args.filter else None
+        if filter_tags:
+            print(f"Filter tags: {filter_tags}")
 
         if args.vector:
             vector = [float(x) for x in args.vector.split()]
-            results, times = client.query(args.name, vector, k=args.k, hybrid=hybrid)
+            results, times = client.query(args.name, vector, k=args.k, hybrid=hybrid, batch_size=args.batch_size, filter_tags=filter_tags)
             print(f"Query: {vector[:5]}...")
             print(f"Results: {[_fmt_result(r) for r in results[:args.k]]}")
         elif args.file:
             if not os.path.exists(args.file):
                 raise FileNotFoundError(args.file)
-            results, times = client.query_from_file(args.name, args.file, hybrid=hybrid, k=args.k)
+            results, times = client.query_from_file(args.name, args.file, hybrid=hybrid, k=args.k, batch_size=args.batch_size, filter_tags=filter_tags)
             print(f"Results ({len(results)} queries):")
             for i, res in enumerate(results[:5]):
                 print(f"  Query {i}: {[_fmt_result(r) for r in res[:args.k]]}")
             if len(results) > 5:
                 print(f"  ... and {len(results) - 5} more queries")
 
+        if args.batch_size:
+            print(f"Batch size: {args.batch_size} (override)")
         print(f"\nSearch mode: {'hybrid (indexed + pending)' if hybrid else 'indexed only'}")
+        if filter_tags:
+            print(f"Filter tags: {filter_tags}")
         if "error" not in times:
             print(f"Query times: {json.dumps(times, indent=2)}")
 

@@ -1,8 +1,10 @@
 import faiss
 import numpy as np
 import orjson
+import boto3
 from lithops import Storage
 import time
+import json
 from collections import defaultdict
 import os
 import csv
@@ -11,37 +13,153 @@ import io
 from vectordb.core.querying import QueryStrategy
 
 
+def _centroid_tags_match(centroid_tags, filter_tags):
+    """Check if a centroid's aggregated tags match ALL filter key-value pairs.
+    
+    Centroid tags are stored as {key: [values...]} (list of possible values).
+    A filter {k: v} matches if v is in centroid_tags[k].
+    """
+    if not filter_tags:
+        return True
+    if not centroid_tags:
+        return False
+    for k, v in filter_tags.items():
+        values = centroid_tags.get(k)
+        if not values:
+            return False
+        if isinstance(values, list):
+            if v not in values:
+                return False
+        elif isinstance(values, str):
+            if values != v:
+                return False
+        else:
+            if values != v:
+                return False
+    return True
+
+
+def _get_matching_centroids(table, dataset, num_index, filter_tags):
+    """Query DynamoDB for centroids whose aggregated tags match the filter.
+    Returns list of centroid IDs (ints) that match.
+    """
+    if not filter_tags:
+        return list(range(num_index))
+
+    matching = []
+
+    try:
+        response = table.scan(
+            FilterExpression=(
+                boto3.dynamodb.conditions.Attr('sk').eq('META') &
+                boto3.dynamodb.conditions.Attr('dataset').eq(dataset)
+            )
+        )
+        items = response.get("Items", [])
+    except Exception as e:
+        print(f"DynamoDB scan failed (falling back to all centroids): {e}")
+        return list(range(num_index))
+
+    for item in items:
+        cid = int(item["centroid_id"])
+        tags = item.get("tags")
+        if tags and _centroid_tags_match(tags, filter_tags):
+            matching.append(cid)
+
+    return matching
+
+
+def _get_matching_pending_files(table, dataset, filter_tags):
+    """Query DynamoDB for pending files whose tags match the filter.
+    Returns list of file keys that match, or None if no filter (all pending).
+    Returns empty list if filter set but no matches or query fails.
+    """
+    if not filter_tags:
+        return None  # None means "all pending"
+
+    matching = []
+    try:
+        response = table.query(
+            KeyConditionExpression=boto3.dynamodb.conditions.Key('centroid_id').eq('PENDING')
+        )
+        items = response.get("Items", [])
+    except Exception:
+        return []  # If DynamoDB fails, don't search any pending files
+
+    for item in items:
+        if item.get("dataset") != dataset:
+            continue
+        raw_tags = item.get("tags")
+        if not raw_tags:
+            continue
+        if isinstance(raw_tags, str):
+            tags = json.loads(raw_tags)
+        else:
+            tags = raw_tags
+        if _centroid_tags_match(tags, filter_tags):
+            matching.append(item["file_key"])
+
+    return matching
+
+
 class BlocksQueryStrategy(QueryStrategy):
 
-    def create_map_tasks(self, queries_key, config, storage=None):
+    def create_map_tasks(self, queries_key, config, storage=None, filter_tags=None):
         tasks = []
-        for i in range(0, config.num_index, config.query_batch_size):
+
+        if filter_tags:
+            table_name = getattr(config, 'dynamodb_table_name', "BlocksDB-default")
+            region = getattr(config, 'dynamodb_region', None)
+            try:
+                if region:
+                    dynamodb = boto3.resource("dynamodb", region_name=region)
+                else:
+                    dynamodb = boto3.resource("dynamodb")
+                table = dynamodb.Table(table_name)
+            except Exception:
+                table = None
+
+            if table:
+                centroid_ids = _get_matching_centroids(table, config.dataset, config.num_index, filter_tags)
+                pending_csvs = _get_matching_pending_files(table, config.dataset, filter_tags)
+            else:
+                centroid_ids = list(range(config.num_index))
+                pending_csvs = None
+        else:
+            centroid_ids = list(range(config.num_index))
+            pending_csvs = None
+
+        for i in range(0, len(centroid_ids), config.query_batch_size):
+            batch = centroid_ids[i:i + config.query_batch_size]
             tasks.append(
                 (
-                    (queries_key, list(range(i, min(i + config.query_batch_size, config.num_index)))),
+                    (queries_key, batch),
                     config.k_search,
                     config
                 )
             )
 
-        if storage is not None:
-            pending_prefix = f"pending/{config.dataset}/"
-            try:
-                pending_files = storage.list_keys(config.storage_bucket, pending_prefix)
-                pending_csvs = [
-                    f for f in pending_files
-                    if f.endswith(".csv") and f != pending_prefix
-                ]
-                if pending_csvs:
-                    tasks.append(
-                        (
-                            ("pending", queries_key, pending_csvs),
-                            config.k_search,
-                            config
-                        )
-                    )
-            except Exception:
-                pass
+        if pending_csvs is None:
+            pending_csvs = []
+            if storage is not None:
+                pending_prefix = f"pending/{config.dataset}/"
+                try:
+                    pending_files = storage.list_keys(config.storage_bucket, pending_prefix)
+                    pending_csvs = [
+                        f for f in pending_files
+                        if f.endswith(".csv") and f != pending_prefix
+                    ]
+                except Exception:
+                    pass
+
+        if pending_csvs:
+            tasks.append(
+                (
+                    ("pending", queries_key, pending_csvs),
+                    config.k_search,
+                    config
+                )
+            )
 
         return tasks
 
@@ -90,7 +208,10 @@ def _search_pending(queries_key, pending_files, k, storage, config, start, sourc
     all_vectors = []
 
     for pf in pending_files:
-        raw = storage.get_object(bucket=config.storage_bucket, key=pf)
+        try:
+            raw = storage.get_object(bucket=config.storage_bucket, key=pf)
+        except Exception:
+            continue
         if isinstance(raw, bytes):
             raw = raw.decode()
         reader = csv.reader(io.StringIO(raw))

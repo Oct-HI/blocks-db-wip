@@ -143,9 +143,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
 
 def accumulate_file(bucket: str, key: str, table):
-    """Accumulate file size in DynamoDB."""
+    """Accumulate file size in DynamoDB, carrying over user tags from S3 metadata."""
     head = s3.head_object(Bucket=bucket, Key=key)
     file_size = head["ContentLength"]
+    
+    s3_metadata = head.get("Metadata", {})
+    tags_str = s3_metadata.get("tags")
+    tags = json.loads(tags_str) if tags_str else None
     
     response = table.update_item(
         Key={"centroid_id": "GLOBAL_CONFIG", "sk": "META"},
@@ -161,7 +165,7 @@ def accumulate_file(bucket: str, key: str, table):
     parts = key.split("/")
     dataset_name = parts[1] if len(parts) > 1 else "default"
     
-    table.put_item(Item={
+    item = {
         "centroid_id": str(current_centroid_id),
         "sk": f"FILE#{key}",
         "prefix": "/".join(parts[:-1]),
@@ -169,7 +173,10 @@ def accumulate_file(bucket: str, key: str, table):
         "dataset": dataset_name,
         "size": file_size,
         "timestamp": int(time.time() * 1000)
-    })
+    }
+    if tags:
+        item["tags"] = json.dumps(tags)
+    table.put_item(Item=item)
     
     return {"centroid": current_centroid_id, "total_size": total_size, "dataset": dataset_name}
 
@@ -221,7 +228,7 @@ def ensure_global_metadata(table, bucket=None, dataset=None):
 
 
 def move_indexed_files_to_processed(bucket: str, table, centroid_id: int):
-    """Delete processed files from pending/ (the processed batch is written separately with corrected IDs)."""
+    """Delete processed files from pending/ and clean up DynamoDB PENDING tracking entries."""
     files = get_files_for_centroid(centroid_id, table)
     if not files:
         return
@@ -233,6 +240,11 @@ def move_indexed_files_to_processed(bucket: str, table, centroid_id: int):
             print(f"Deleted processed pending file: {source_key}")
         except Exception as e:
             print(f"Error deleting file {f.get('file_key')}: {e}")
+        try:
+            table.delete_item(Key={"centroid_id": "PENDING", "sk": f"FILE#{source_key}"})
+            print(f"Cleaned up PENDING tracking for {source_key}")
+        except Exception as e:
+            print(f"Error cleaning up PENDING tracking for {source_key}: {e}")
 
 
 def save_processed_batch(bucket: str, dataset: str, centroid_id: int, new_ids: List[int], vectors: List[List[float]]) -> None:
@@ -326,6 +338,45 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
     save_processed_batch(bucket, dataset, centroid_id, new_ids, vectors)
     
     update_config_num_index(bucket, dataset, centroid_id + 1)
+
+    save_centroid_tags(centroid_id, dataset, files, table)
+
+
+def save_centroid_tags(centroid_id: int, dataset: str, files: List[Dict], table):
+    """Aggregate user tags from all files in a centroid and store as a META item."""
+    aggregated = {}
+    for f in files:
+        raw_tags = f.get("tags")
+        if not raw_tags:
+            continue
+        if isinstance(raw_tags, str):
+            try:
+                tags = json.loads(raw_tags)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        else:
+            tags = raw_tags
+        if not isinstance(tags, dict):
+            continue
+        for k, v in tags.items():
+            if k not in aggregated:
+                aggregated[k] = set()
+            aggregated[k].add(v)
+
+    if not aggregated:
+        return
+
+    tags_map = {k: list(v) for k, v in aggregated.items()}
+    try:
+        table.put_item(Item={
+            "centroid_id": str(centroid_id),
+            "sk": "META",
+            "dataset": dataset,
+            "tags": tags_map
+        })
+        print(f"Saved centroid tags for centroid {centroid_id}: {tags_map}")
+    except Exception as e:
+        print(f"Error saving centroid tags: {e}")
 
 
 def update_config_num_index(bucket: str, dataset: str, num_index: int):

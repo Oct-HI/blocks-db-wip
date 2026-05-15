@@ -62,6 +62,12 @@ class SvlessVectorDBParams:
     auto_index_threshold_mb: Optional[int] = None
     dynamodb_table_name: str = "BlocksDB-VectorIndex"
     
+    # Tag filtering (per-query, not persisted)
+    filter_tags: dict = None
+
+    # DynamoDB connection info (injected at query time)
+    dynamodb_region: str = None
+
     # Extra fields from index config
     total_vectors: int = -1
     bytes_per_vector: int = 776

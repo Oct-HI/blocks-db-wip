@@ -59,7 +59,7 @@ class VectorDBClient:
         self.tracker.delete_tracking(name)
         print(f"Dataset '{name}' deleted.")
 
-    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], auto_index: bool = False):
+    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], auto_index: bool = False, tags: dict = None):
         """
         Add new vectors to the pending storage (not yet indexed).
         
@@ -67,17 +67,18 @@ class VectorDBClient:
             dataset_name: Name of the dataset
             vectors: List of (id, vector) tuples
             auto_index: If True and threshold reached, trigger indexing (requires Lambda setup)
+            tags: Optional dict of key-value tags (e.g. {"source": "web"})
             
         Returns:
             Number of vectors added
         """
-        count = self.tracker.put_vectors(dataset_name, vectors)
+        count = self.tracker.put_vectors(dataset_name, vectors, tags=tags)
         print(f"Added {count} vectors to pending storage for dataset '{dataset_name}'.")
         return count
 
-    def put_vector(self, dataset_name: str, vector_id: int, vector: List[float]):
+    def put_vector(self, dataset_name: str, vector_id: int, vector: List[float], tags: dict = None):
         """Add a single vector to pending storage."""
-        return self.put_vectors(dataset_name, [(vector_id, vector)])
+        return self.put_vectors(dataset_name, [(vector_id, vector)], tags=tags)
 
     def get_pending_vectors(self, dataset_name: str) -> List[Tuple[int, List[float]]]:
         """Get all vectors that are pending indexing."""
@@ -422,7 +423,7 @@ class VectorDBClient:
 
         print(f"Deleted {deleted_count} config(s) for dataset '{dataset_name}'")
     
-    def query(self, dataset_name: str, vector: List[float], k: int = None, hybrid: bool = True):
+    def query(self, dataset_name: str, vector: List[float], k: int = None, hybrid: bool = True, batch_size: int = None, filter_tags: dict = None):
         """
         Query a single vector. Always searches everything (indexed + pending).
         
@@ -431,14 +432,16 @@ class VectorDBClient:
             vector: Query vector (list of floats)
             k: Number of results (defaults to config k_result)
             hybrid: If True, include pending vectors in search (default: True)
+            batch_size: Override query_batch_size for this query
+            filter_tags: Optional dict of tag filters (e.g. {"source": "web"}). Only centroids/pending files matching ALL tags are searched.
             
         Returns:
             List of (id, distance) tuples sorted by distance
         """
-        results, times = self.query_batch(dataset_name, [vector], k=k, hybrid=hybrid)
+        results, times = self.query_batch(dataset_name, [vector], k=k, hybrid=hybrid, batch_size=batch_size, filter_tags=filter_tags)
         return results[0], times
 
-    def query_batch(self, dataset_name: str, vectors: List[List[float]], k: int = None, hybrid: bool = True):
+    def query_batch(self, dataset_name: str, vectors: List[List[float]], k: int = None, hybrid: bool = True, batch_size: int = None, filter_tags: dict = None):
         """
         Query multiple vectors. Always searches everything (indexed + pending) by default.
         
@@ -447,6 +450,8 @@ class VectorDBClient:
             vectors: List of query vectors
             k: Number of results per query
             hybrid: If True, include pending vectors in search (default: True)
+            batch_size: Override query_batch_size for this query
+            filter_tags: Optional dict of tag filters (e.g. {"source": "web"}). Only centroids/pending files matching ALL tags are searched.
             
         Returns:
             neighbours, times
@@ -458,11 +463,11 @@ class VectorDBClient:
         vectors_np = np.array(vectors)
         
         if hybrid:
-            return self._query_hybrid(dataset_name, vectors_np, k)
+            return self._query_hybrid(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
         else:
-            return self._query_indexed_only(dataset_name, vectors_np, k)
+            return self._query_indexed_only(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
     
-    def query_indexed_only(self, dataset_name: str, vector: List[float] = None, vectors: List[List[float]] = None, k: int = None):
+    def query_indexed_only(self, dataset_name: str, vector: List[float] = None, vectors: List[List[float]] = None, k: int = None, batch_size: int = None, filter_tags: dict = None):
         """
         Query only the indexed vectors (no pending).
         
@@ -471,6 +476,8 @@ class VectorDBClient:
             vector: Single query vector
             vectors: Multiple query vectors (alternative to single vector)
             k: Number of results
+            batch_size: Override query_batch_size for this query
+            filter_tags: Optional dict of tag filters (e.g. {"source": "web"})
             
         Returns:
             Search results from indexed data only
@@ -482,15 +489,17 @@ class VectorDBClient:
         else:
             raise ValueError("Provide either vector or vectors")
         
-        return self._query_indexed_only(dataset_name, np.array(vecs), k)
+        return self._query_indexed_only(dataset_name, np.array(vecs), k, batch_size=batch_size, filter_tags=filter_tags)
 
-    def _query_indexed_only(self, dataset_name: str, vectors_np: np.ndarray, k: int = None):
+    def _query_indexed_only(self, dataset_name: str, vectors_np: np.ndarray, k: int = None, batch_size: int = None, filter_tags: dict = None):
         """Query only the FAISS index (no pending vectors)."""
         k = k if k is not None else self._get_k_result(dataset_name)
         
         try:
-            sv_vectordb = self._load_default_index(dataset_name)
-            neighbours, times = sv_vectordb.search(0, vectors_np)
+            sv_vectordb = self._load_default_index(dataset_name, batch_size=batch_size, filter_tags=filter_tags)
+            neighbours, times = sv_vectordb.search(0, vectors_np, filter_tags=filter_tags)
+            if not neighbours:
+                neighbours = [[] for _ in range(len(vectors_np))]
         except ValueError as e:
             print(f"No index available: {e}")
             neighbours = [[] for _ in range(len(vectors_np))]
@@ -498,18 +507,18 @@ class VectorDBClient:
         
         return neighbours, times
 
-    def _query_hybrid(self, dataset_name: str, vectors_np: np.ndarray, k: int = None):
+    def _query_hybrid(self, dataset_name: str, vectors_np: np.ndarray, k: int = None, batch_size: int = None, filter_tags: dict = None):
         """Internal hybrid query implementation."""
         k = k if k is not None else self._get_k_result(dataset_name)
 
         try:
-            sv_vectordb = self._load_default_index(dataset_name)
-            results, times = sv_vectordb.search(0, vectors_np)
+            sv_vectordb = self._load_default_index(dataset_name, batch_size=batch_size, filter_tags=filter_tags)
+            results, times = sv_vectordb.search(0, vectors_np, filter_tags=filter_tags)
         except ValueError:
             results = None
             times = {"error": "no index available"}
 
-        if results is None and self.has_pending_vectors(dataset_name):
+        if not results and self.has_pending_vectors(dataset_name):
             from .utils.hybrid_search import brute_force_search
             unindexed = self.get_pending_vectors(dataset_name)
             if unindexed:
@@ -518,15 +527,17 @@ class VectorDBClient:
                     r[:] = [(vid, dist, "pending") for vid, dist in r]
                 times = {"fallback": "no index, searched pending only"}
 
-        if results is None:
+        if not results:
             results = [[] for _ in range(len(vectors_np))]
 
         times["hybrid_search"] = True
         times["has_pending"] = self.has_pending_vectors(dataset_name)
+        if filter_tags:
+            times["filter_tags"] = filter_tags
 
         return results, times
     
-    def query_from_file(self, dataset_name: str, csv_path: str, hybrid: bool = True, k: int = None):
+    def query_from_file(self, dataset_name: str, csv_path: str, hybrid: bool = True, k: int = None, batch_size: int = None, filter_tags: dict = None):
         """
         Query ALL vectors from a CSV file. Always searches everything by default.
         
@@ -535,6 +546,8 @@ class VectorDBClient:
             csv_path: Path to CSV file with query vectors (space-separated floats per row)
             hybrid: If True, include pending vectors (default: True)
             k: Number of results per query
+            batch_size: Override query_batch_size for this query
+            filter_tags: Optional dict of tag filters (e.g. {"source": "web"})
             
         Returns:
             neighbours, times
@@ -559,11 +572,11 @@ class VectorDBClient:
         vectors_np = np.array(vectors)
         
         if hybrid:
-            return self._query_hybrid(dataset_name, vectors_np, k)
+            return self._query_hybrid(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
         else:
-            return self._query_indexed_only(dataset_name, vectors_np, k)
+            return self._query_indexed_only(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
 
-    def query_hybrid(self, dataset_name: str, vectors: List[List[float]], k: int = None):
+    def query_hybrid(self, dataset_name: str, vectors: List[List[float]], k: int = None, batch_size: int = None, filter_tags: dict = None):
         """
         Explicit hybrid query - searches both indexed and pending vectors.
         Alias for query_batch with hybrid=True.
@@ -572,11 +585,13 @@ class VectorDBClient:
             dataset_name: Name of the dataset
             vectors: List of query vectors
             k: Number of results per query (defaults to config k_result)
+            batch_size: Override query_batch_size for this query
+            filter_tags: Optional dict of tag filters (e.g. {"source": "web"})
             
         Returns:
             Merged search results with (id, distance) tuples
         """
-        return self.query_batch(dataset_name, vectors, k=k, hybrid=True)
+        return self.query_batch(dataset_name, vectors, k=k, hybrid=True, batch_size=batch_size, filter_tags=filter_tags)
 
     def _get_k_result(self, dataset_name: str) -> int:
         """Get k_result from index config."""
@@ -601,7 +616,7 @@ class VectorDBClient:
         implementation, num_index = indexes[0]
         return load_index_config(self.bucket, dataset_name, implementation, num_index)
     
-    def _load_default_index(self, dataset_name: str):
+    def _load_default_index(self, dataset_name: str, batch_size: int = None, filter_tags: dict = None):
         """
         Load the only stored index config for a dataset.
         Raises error if none or more than one exist.
@@ -629,5 +644,12 @@ class VectorDBClient:
 
         config["dataset"] = dataset_name
         config["storage_bucket"] = self.bucket
+        config["dynamodb_table_name"] = self.tracker.DYNAMODB_TABLE_NAME
+        config["dynamodb_region"] = self.tracker.dynamodb.meta.client.meta.region_name
+
+        if batch_size is not None:
+            config["query_batch_size"] = batch_size
+        if filter_tags is not None:
+            config["filter_tags"] = filter_tags
 
         return ServerlessVectorDB(**config)
