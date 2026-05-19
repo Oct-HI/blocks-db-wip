@@ -70,7 +70,7 @@ def reindex_single_config(bucket, dataset_name, config, num_workers=16):
     sv_vectordb = ServerlessVectorDB(**config)
 
     total_times = sv_vectordb.indexing(
-        f"vectors_{dataset_name}.csv",
+        f"datasets/{dataset_name}/source.csv",
         num_workers
     )
 

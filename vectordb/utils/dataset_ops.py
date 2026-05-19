@@ -38,7 +38,7 @@ def get_last_id_and_dim(bucket, key):
 
 
 def upload_dataset(bucket, dataset_name, csv_path):
-    key = f"vectors_{dataset_name}.csv"
+    key = f"datasets/{dataset_name}/source.csv"
 
     s3.upload_file(csv_path, bucket, key)
 
@@ -49,7 +49,7 @@ def upload_dataset(bucket, dataset_name, csv_path):
 
 
 def delete_dataset(bucket, dataset_name):
-    main_key = f"vectors_{dataset_name}.csv"
+    main_key = f"datasets/{dataset_name}/source.csv"
     true_key = f"true_neighbours_{dataset_name}.csv"
 
     try:
@@ -69,7 +69,7 @@ def delete_dataset(bucket, dataset_name):
 
 
 def update_dataset(bucket, dataset_name, new_vectors, reindex=True):
-    key = f"vectors_{dataset_name}.csv"
+    key = f"datasets/{dataset_name}/source.csv"
 
     last_id, expected_dim = get_last_id_and_dim(bucket, key)
 
@@ -106,7 +106,7 @@ def update_dataset_from_file(
     new_vectors_csv_path,
     reindex=True
 ):
-    key = f"vectors_{dataset_name}.csv"
+    key = f"datasets/{dataset_name}/source.csv"
 
     vectors = load_vectors_from_csv(new_vectors_csv_path)
 
@@ -160,7 +160,7 @@ def delete_vectors_from_dataset(
     if not ids_to_delete:
         raise ValueError("No vector IDs provided for deletion.")
 
-    key = f"vectors_{dataset_name}.csv"
+    key = f"datasets/{dataset_name}/source.csv"
 
     # Download dataset locally
     with tempfile.NamedTemporaryFile(delete=False) as tmp:

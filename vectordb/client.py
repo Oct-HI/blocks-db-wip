@@ -112,7 +112,7 @@ class VectorDBClient:
         List all datasets in bucket following naming convention.
         """
 
-        response = self.s3.list_objects_v2(Bucket=self.bucket)
+        response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix="datasets/")
 
         datasets = []
 
@@ -122,8 +122,8 @@ class VectorDBClient:
         for obj in response["Contents"]:
             key = obj["Key"]
 
-            if key.startswith("vectors_") and key.endswith(".csv"):
-                name = key.replace("vectors_", "").replace(".csv", "")
+            if key.endswith("/source.csv"):
+                name = key.split("/")[1]
                 datasets.append(name)
 
         return datasets
@@ -165,7 +165,7 @@ class VectorDBClient:
         print(f"Initializing ServerlessVectorDB for dataset '{dataset_name}'...")
         sv_vectordb = ServerlessVectorDB(**config)
 
-        filename = f"vectors_{dataset_name}.csv"
+        filename = f"datasets/{dataset_name}/source.csv"
 
         print("Starting indexing...")
         total_times = sv_vectordb.indexing(filename, num_workers)
@@ -207,7 +207,7 @@ class VectorDBClient:
     def _get_vector_count(self, dataset_name: str) -> int:
         """Count total vectors in dataset."""
         s3 = boto3.client("s3")
-        key = f"vectors_{dataset_name}.csv"
+        key = f"datasets/{dataset_name}/source.csv"
         try:
             response = s3.get_object(Bucket=self.bucket, Key=key)
             content = response['Body'].read().decode('utf-8')
@@ -279,7 +279,7 @@ class VectorDBClient:
         config["storage_bucket"] = self.bucket
         
         sv_vectordb = ServerlessVectorDB(**config)
-        filename = f"vectors_{dataset_name}.csv"
+        filename = f"datasets/{dataset_name}/source.csv"
         
         print("Rebuilding indexes with pending vectors...")
         total_times = sv_vectordb.indexing(filename, num_workers)
@@ -323,7 +323,7 @@ class VectorDBClient:
 
     def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int):
         """Read the main CSV and track all vectors as indexed + build csv_blocks for optimized get."""
-        key = f"vectors_{dataset_name}.csv"
+        key = f"datasets/{dataset_name}/source.csv"
         indexed_ids = []
         block_size = 500000  # ~500KB per block
         blocks = []
@@ -376,7 +376,7 @@ class VectorDBClient:
                 })
 
             if blocks:
-                blocks_key = f"csv_blocks_{dataset_name}.json"
+                blocks_key = f"tracking/csv_blocks_{dataset_name}.json"
                 self.s3.put_object(Bucket=self.bucket, Key=blocks_key, Body=json.dumps(blocks))
                 print(f"Built {len(blocks)} CSV blocks for optimized get.")
 

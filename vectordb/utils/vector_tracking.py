@@ -46,7 +46,7 @@ class VectorIndexTracker:
         return f"pending/{dataset_name}/{file_id}.csv"
 
     def get_indexed_ids_key(self, dataset_name: str) -> str:
-        return f"indexed_ids_{dataset_name}.json"
+        return f"tracking/indexed_ids_{dataset_name}.json"
 
     def initialize_next_id(self, dataset_name: str, next_id: int):
         """Initialize the next available ID counter in DynamoDB for a dataset."""

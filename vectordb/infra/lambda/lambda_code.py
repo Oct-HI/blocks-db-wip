@@ -430,7 +430,7 @@ def get_next_available_id_atomic(bucket: str, dataset: str, count: int) -> int:
 
 def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
     """Track indexed vector IDs in S3 for status commands (optional with atomic DynamoDB counter)."""
-    key = f"indexed_ids_{dataset}.json"
+    key = f"tracking/indexed_ids_{dataset}.json"
     try:
         existing = s3.get_object(Bucket=bucket, Key=key)
         import orjson

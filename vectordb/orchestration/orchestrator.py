@@ -1,3 +1,4 @@
+import uuid
 from lithops import FunctionExecutor, Storage
 import time
 import importlib
@@ -78,7 +79,8 @@ class Orchestrator:
 
         start = init = time.time()
 
-        queries_key = f"queries_{self.config.dataset}_{self.config.num_index}.csv"
+        queries_suffix = uuid.uuid4().hex
+        queries_key = f"queries/testdata/{queries_suffix}_queries_{self.config.dataset}_{self.config.num_index}.csv"
         self.function_executor.storage.put_object(
             bucket=self.config.storage_bucket,
             key=queries_key,
@@ -105,6 +107,8 @@ class Orchestrator:
         ]
         map_execution = time.time()
         map_res, map_times = self.divide_map_results(map_futures_res)
+
+        self.pool.submit(self.function_executor.storage.delete_object, self.config.storage_bucket, queries_key)
 
         # --- Reduce ---
         reduce_iterdata, reduce_iterdata_times = self.create_reduce_iterdata(map_res, k_result, 1000)
