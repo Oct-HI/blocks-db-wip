@@ -52,8 +52,8 @@ class VectorIndexTracker:
         """Initialize the next available ID counter in DynamoDB for a dataset."""
         try:
             self.table.put_item(Item={
-                "centroid_id": "ID_TRACKER",
-                "sk": dataset_name,
+                "centroid_id": f"{dataset_name}_ID_TRACKER",
+                "sk": "META",
                 "next_id": next_id,
                 "dataset": dataset_name
             })
@@ -65,7 +65,7 @@ class VectorIndexTracker:
         """Atomically get and reserve the next `count` IDs. Returns the starting ID."""
         try:
             response = self.table.update_item(
-                Key={"centroid_id": "ID_TRACKER", "sk": dataset_name},
+                Key={"centroid_id": f"{dataset_name}_ID_TRACKER", "sk": "META"},
                 UpdateExpression="SET next_id = if_not_exists(next_id, :zero) + :inc",
                 ExpressionAttributeValues={":inc": count, ":zero": 0},
                 ReturnValues="ALL_NEW"
@@ -80,7 +80,7 @@ class VectorIndexTracker:
         """Get the next available ID from DynamoDB counter."""
         try:
             response = self.table.get_item(
-                Key={"centroid_id": "ID_TRACKER", "sk": dataset_name}
+                Key={"centroid_id": f"{dataset_name}_ID_TRACKER", "sk": "META"}
             )
             item = response.get("Item", {})
             return item.get("next_id", 0)

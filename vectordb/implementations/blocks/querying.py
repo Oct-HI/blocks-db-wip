@@ -49,19 +49,19 @@ def _get_matching_centroids(table, dataset, num_index, filter_tags):
     matching = []
 
     try:
-        response = table.scan(
-            FilterExpression=(
-                boto3.dynamodb.conditions.Attr('sk').eq('META') &
-                boto3.dynamodb.conditions.Attr('dataset').eq(dataset)
+        response = table.query(
+            KeyConditionExpression=(
+                boto3.dynamodb.conditions.Key('centroid_id').eq(f"DATASET#{dataset}") &
+                boto3.dynamodb.conditions.Key('sk').begins_with('CENTROID#')
             )
         )
         items = response.get("Items", [])
     except Exception as e:
-        print(f"DynamoDB scan failed (falling back to all centroids): {e}")
+        print(f"DynamoDB query failed (falling back to all centroids): {e}")
         return list(range(num_index))
 
     for item in items:
-        cid = int(item["centroid_id"])
+        cid = int(item["sk"].split("#")[1])
         tags = item.get("tags")
         if tags and _centroid_tags_match(tags, filter_tags):
             matching.append(cid)

@@ -57,25 +57,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     threshold_bytes = get_threshold_bytes(event)
     print(f"Using threshold: {threshold_bytes:,} bytes")
     
+    datasets_seen = set()
+    
     for record in event.get("Records", []):
         bucket = record["s3"]["bucket"]["name"]
         key = record["s3"]["object"]["key"]
         if not key.endswith(".csv"):
             continue
-        parts = key.split("/")
-        if len(parts) > 1:
-            dataset = parts[1]
-            ensure_global_metadata(table, bucket, dataset)
-            break
-    
-    ensure_global_metadata(table)
-    
-    for record in event.get("Records", []):
-        bucket = record["s3"]["bucket"]["name"]
-        key = record["s3"]["object"]["key"]
         
-        if not key.endswith(".csv"):
+        parts = key.split("/")
+        if len(parts) <= 1:
             continue
+        dataset = parts[1]
+        datasets_seen.add(dataset)
         
         s3_metadata = {}
         try:
@@ -83,6 +77,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             s3_metadata = head.get("Metadata", {})
         except Exception:
             pass
+        
+        ensure_global_metadata(table, bucket, dataset)
         
         record_threshold = get_threshold_bytes(event, s3_metadata)
         if record_threshold != threshold_bytes:
@@ -96,48 +92,47 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             print(f"Error accumulating {key}: {e}")
             raise
     
-    response = table.get_item(
-        Key={"centroid_id": "GLOBAL_CONFIG", "sk": "META"}
-    )
-    item = response.get("Item", {})
-    total_size = int(item.get("current_accumulated_size", 0))
-    current_centroid_id = int(item.get("current_centroid_id", 0))
-    
-    print(f"State before indexing: centroid_id={current_centroid_id}, accumulated={total_size} bytes, threshold={threshold_bytes}")
-    
-    if total_size >= threshold_bytes:
-        print(f"Threshold reached, triggering indexing for centroid {current_centroid_id}")
+    for dataset in datasets_seen:
+        pk = f"{dataset}_CONFIG"
+        response = table.get_item(Key={"centroid_id": pk, "sk": "META"})
+        item = response.get("Item", {})
+        total_size = int(item.get("current_accumulated_size", 0))
+        current_centroid_id = int(item.get("current_centroid_id", 0))
         
-        try:
-            response = table.update_item(
-                Key={"centroid_id": "GLOBAL_CONFIG", "sk": "META"},
-                UpdateExpression="SET current_centroid_id = current_centroid_id + :inc, current_accumulated_size = :zero",
-                ConditionExpression="current_centroid_id = :old_id",
-                ExpressionAttributeValues={
-                    ":inc": 1,
-                    ":zero": 0,
-                    ":old_id": current_centroid_id
-                },
-                ReturnValues="ALL_NEW"
-            )
+        print(f"[{dataset}] State: centroid_id={current_centroid_id}, accumulated={total_size} bytes, threshold={threshold_bytes}")
+        
+        if total_size >= threshold_bytes:
+            print(f"[{dataset}] Threshold reached, triggering indexing for centroid {current_centroid_id}")
             
-            new_centroid_id = int(response["Attributes"]["current_centroid_id"])
-            print(f"Successfully claimed centroid {current_centroid_id} (now {new_centroid_id})")
-            
-            files = get_files_for_centroid(current_centroid_id, table)
-            if files:
-                dataset = files[0].get("dataset", "default")
-                create_index_for_centroid(current_centroid_id, bucket, dataset, table)
-                move_indexed_files_to_processed(bucket, table, current_centroid_id)
-                print(f"Index created for centroid {current_centroid_id}")
-            else:
-                print(f"No files found for centroid {current_centroid_id}")
-            
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                print("Another worker already started indexing - skipping")
-            else:
-                raise
+            try:
+                response = table.update_item(
+                    Key={"centroid_id": pk, "sk": "META"},
+                    UpdateExpression="SET current_centroid_id = current_centroid_id + :inc, current_accumulated_size = :zero",
+                    ConditionExpression="current_centroid_id = :old_id",
+                    ExpressionAttributeValues={
+                        ":inc": 1,
+                        ":zero": 0,
+                        ":old_id": current_centroid_id
+                    },
+                    ReturnValues="ALL_NEW"
+                )
+                
+                new_centroid_id = int(response["Attributes"]["current_centroid_id"])
+                print(f"[{dataset}] Claimed centroid {current_centroid_id} (now {new_centroid_id})")
+                
+                files = get_files_for_centroid(dataset, current_centroid_id, table)
+                if files:
+                    create_index_for_centroid(current_centroid_id, bucket, dataset, table)
+                    move_indexed_files_to_processed(bucket, table, dataset, current_centroid_id)
+                    print(f"[{dataset}] Index created for centroid {current_centroid_id}")
+                else:
+                    print(f"[{dataset}] No files found for centroid {current_centroid_id}")
+                    
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    print(f"[{dataset}] Another worker already started indexing - skipping")
+                else:
+                    raise
     
     return {"statusCode": 200, "body": "OK"}
 
@@ -147,12 +142,16 @@ def accumulate_file(bucket: str, key: str, table):
     head = s3.head_object(Bucket=bucket, Key=key)
     file_size = head["ContentLength"]
     
+    parts = key.split("/")
+    dataset_name = parts[1] if len(parts) > 1 else "default"
+    
     s3_metadata = head.get("Metadata", {})
     tags_str = s3_metadata.get("tags")
     tags = json.loads(tags_str) if tags_str else None
     
+    pk = f"{dataset_name}_CONFIG"
     response = table.update_item(
-        Key={"centroid_id": "GLOBAL_CONFIG", "sk": "META"},
+        Key={"centroid_id": pk, "sk": "META"},
         UpdateExpression="SET current_accumulated_size = if_not_exists(current_accumulated_size, :zero) + :s",
         ExpressionAttributeValues={":s": file_size, ":zero": 0},
         ReturnValues="ALL_NEW"
@@ -162,11 +161,8 @@ def accumulate_file(bucket: str, key: str, table):
     current_centroid_id = int(attrs.get("current_centroid_id", 0))
     total_size = int(attrs.get("current_accumulated_size", 0))
     
-    parts = key.split("/")
-    dataset_name = parts[1] if len(parts) > 1 else "default"
-    
     item = {
-        "centroid_id": str(current_centroid_id),
+        "centroid_id": f"{dataset_name}#{current_centroid_id}",
         "sk": f"FILE#{key}",
         "prefix": "/".join(parts[:-1]),
         "file_key": parts[-1],
@@ -207,29 +203,32 @@ def get_starting_index_from_config(bucket, dataset):
 
 
 def ensure_global_metadata(table, bucket=None, dataset=None):
-    """Ensure the GLOBAL_CONFIG metadata item exists with initial values."""
-    if bucket and dataset and _configured_starting_index is None:
+    """Ensure the per-dataset config item exists with initial values."""
+    if not dataset:
+        return
+    if bucket and _configured_starting_index is None:
         get_starting_index_from_config(bucket, dataset)
     
+    pk = f"{dataset}_CONFIG"
     try:
         response = table.update_item(
-            Key={"centroid_id": "GLOBAL_CONFIG", "sk": "META"},
+            Key={"centroid_id": pk, "sk": "META"},
             UpdateExpression="SET current_accumulated_size = if_not_exists(current_accumulated_size, :zero), current_centroid_id = if_not_exists(current_centroid_id, :zero)",
             ExpressionAttributeValues={":zero": 0},
             ConditionExpression="attribute_not_exists(current_accumulated_size)",
             ReturnValues="ALL_NEW"
         )
-        print(f"Initialized GLOBAL_CONFIG: centroid_id={response['Attributes'].get('current_centroid_id')}, accumulated={response['Attributes'].get('current_accumulated_size')}")
+        print(f"Initialized {pk}: centroid_id={response['Attributes'].get('current_centroid_id')}, accumulated={response['Attributes'].get('current_accumulated_size')}")
     except ClientError as e:
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            print(f"Warning initializing global metadata (may already exist): {e}")
+            print(f"Warning initializing {pk} (may already exist): {e}")
     except Exception as e:
-        print(f"Warning initializing global metadata: {e}")
+        print(f"Warning initializing {pk}: {e}")
 
 
-def move_indexed_files_to_processed(bucket: str, table, centroid_id: int):
+def move_indexed_files_to_processed(bucket: str, table, dataset: str, centroid_id: int):
     """Delete processed files from pending/ and clean up DynamoDB PENDING tracking entries."""
-    files = get_files_for_centroid(centroid_id, table)
+    files = get_files_for_centroid(dataset, centroid_id, table)
     if not files:
         return
     
@@ -245,6 +244,12 @@ def move_indexed_files_to_processed(bucket: str, table, centroid_id: int):
             print(f"Cleaned up PENDING tracking for {source_key}")
         except Exception as e:
             print(f"Error cleaning up PENDING tracking for {source_key}: {e}")
+        try:
+            centroid_key = f"{dataset}#{centroid_id}"
+            table.delete_item(Key={"centroid_id": centroid_key, "sk": f"FILE#{source_key}"})
+            print(f"Cleaned up centroid tracking for {source_key}")
+        except Exception as e:
+            print(f"Error cleaning up centroid tracking for {source_key}: {e}")
 
 
 def save_processed_batch(bucket: str, dataset: str, centroid_id: int, new_ids: List[int], vectors: List[List[float]]) -> None:
@@ -262,7 +267,7 @@ def save_processed_batch(bucket: str, dataset: str, centroid_id: int, new_ids: L
 
 def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table) -> None:
     """Build and store FAISS index for a centroid."""
-    files = get_files_for_centroid(centroid_id, table)
+    files = get_files_for_centroid(dataset, centroid_id, table)
     
     if not files:
         print(f"No files found for centroid {centroid_id}")
@@ -369,12 +374,11 @@ def save_centroid_tags(centroid_id: int, dataset: str, files: List[Dict], table)
     tags_map = {k: list(v) for k, v in aggregated.items()}
     try:
         table.put_item(Item={
-            "centroid_id": str(centroid_id),
-            "sk": "META",
-            "dataset": dataset,
+            "centroid_id": f"DATASET#{dataset}",
+            "sk": f"CENTROID#{centroid_id}#META",
             "tags": tags_map
         })
-        print(f"Saved centroid tags for centroid {centroid_id}: {tags_map}")
+        print(f"Saved tags for centroids/{dataset}/{centroid_id}: {tags_map}")
     except Exception as e:
         print(f"Error saving centroid tags: {e}")
 
@@ -415,7 +419,7 @@ def get_next_available_id_atomic(bucket: str, dataset: str, count: int) -> int:
     
     try:
         response = table.update_item(
-            Key={"centroid_id": "ID_TRACKER", "sk": dataset},
+            Key={"centroid_id": f"{dataset}_ID_TRACKER", "sk": "META"},
             UpdateExpression="SET next_id = if_not_exists(next_id, :zero) + :inc",
             ExpressionAttributeValues={":inc": count, ":zero": 0},
             ReturnValues="ALL_NEW"
@@ -452,7 +456,7 @@ def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
     return ids
 
 
-def get_files_for_centroid(centroid_id: int, table) -> List[Dict]:
+def get_files_for_centroid(dataset: str, centroid_id: int, table) -> List[Dict]:
     """Query DynamoDB for all files in a centroid."""
     files = []
     done = False
@@ -460,7 +464,7 @@ def get_files_for_centroid(centroid_id: int, table) -> List[Dict]:
     
     while not done:
         kwargs = {"KeyConditionExpression": "centroid_id = :cid"}
-        kwargs["ExpressionAttributeValues"] = {":cid": str(centroid_id)}
+        kwargs["ExpressionAttributeValues"] = {":cid": f"{dataset}#{centroid_id}"}
         if start_key:
             kwargs["ExclusiveStartKey"] = start_key
         

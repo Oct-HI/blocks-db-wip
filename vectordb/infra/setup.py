@@ -1028,7 +1028,7 @@ def create_infrastructure_manually(s3_bucket, create_vector_table=True):
     
     print("\n2. Creating S3 prefixes...")
     s3_client = boto3.client("s3")
-    prefixes = ["pending/", "inputs/", "indexes/"]
+    prefixes = ["pending/", "inputs/", "indexes/", "datasets/", "tracking/"]
     for prefix in prefixes:
         try:
             s3_client.put_object(Bucket=s3_bucket, Key=prefix, Body=b"")
@@ -1071,13 +1071,7 @@ def create_vector_index_table(bucket=None):
         table.meta.client.get_waiter("table_exists").wait(TableName=table_name)
         print(f"  Created DynamoDB table: {table_name}")
         
-        table.put_item(Item={
-            "centroid_id": "GLOBAL",
-            "sk": "META",
-            "current_centroid_id": 0,
-            "current_accumulated_size": 0,
-        })
-        print(f"  Initialized global metadata")
+        print(f"  Skipped global metadata init (per-dataset config created on first use)")
         
     except dynamodb.meta.client.exceptions.ResourceInUseException:
         print(f"  DynamoDB table already exists: {table_name}")
@@ -1088,6 +1082,8 @@ def create_vector_index_table(bucket=None):
         try:
             s3_client.put_object(Bucket=bucket, Key="pending/", Body=b"")
             s3_client.put_object(Bucket=bucket, Key="inputs/", Body=b"")
+            s3_client.put_object(Bucket=bucket, Key="datasets/", Body=b"")
+            s3_client.put_object(Bucket=bucket, Key="tracking/", Body=b"")
             print(f"  Created S3 prefixes for bucket: {bucket}")
         except Exception as e:
             print(f"  Warning: Could not create S3 prefixes: {e}")

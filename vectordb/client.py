@@ -234,7 +234,7 @@ class VectorDBClient:
             num_index = config.get("num_index", 16)
             
             table.update_item(
-                Key={"centroid_id": "GLOBAL_CONFIG", "sk": "META"},
+                Key={"centroid_id": f"{dataset_name}_CONFIG", "sk": "META"},
                 UpdateExpression="SET current_accumulated_size = :zero, current_centroid_id = :next",
                 ExpressionAttributeValues={":zero": 0, ":next": num_index}
             )
