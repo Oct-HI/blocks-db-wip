@@ -2,11 +2,15 @@ import argparse
 import csv
 import json
 import os
+import time
 from pathlib import Path
+
+import boto3
 
 from .client import VectorDBClient
 from .infra import run_setup, refresh_lithops_credentials, get_infra_config
 from .config import DEFAULT_INFRA_CONFIG
+from .utils.s3_utils import is_s3express_bucket, parse_express_az
 
 
 CONFIG_DIR = Path.home() / ".blocks-db-config"
@@ -43,6 +47,7 @@ def main():
     setup_parser.add_argument("--threshold", type=int, default=None, help="Auto-indexer threshold in bytes (default: 5242880)")
     setup_parser.add_argument("--skip-vector-table", action="store_true", help="Skip DynamoDB table creation")
     setup_parser.add_argument("--skip-runtime", action="store_true", help="Skip Lithops runtime build")
+    setup_parser.add_argument("--s3express", action="store_true", help="Use S3 Express One Zone (skips auto-indexer Lambda)")
 
     # ── update-threshold ─────────────────────────────────────
     threshold_parser = subparsers.add_parser("update-threshold", help="Update auto-indexer block size threshold")
@@ -67,6 +72,7 @@ def main():
     init_parser.add_argument("--config", required=True, help="Path to index config JSON")
     init_parser.add_argument("--workers", type=int, default=16, help="Number of indexing workers")
     init_parser.add_argument("--no-update-threshold", action="store_true", help="Skip auto-update threshold after indexing")
+    init_parser.add_argument("--skip-auto-indexer", action="store_true", help="Skip DynamoDB state init and vector tracking (for pure benchmarks)")
 
     # ── put ───────────────────────────────────────────────────
     put_parser = subparsers.add_parser("put", help="Add new vectors (stored as individual files)")
@@ -150,12 +156,26 @@ def main():
             overrides["lambda_role_name"] = args.role_name
         if args.threshold:
             overrides["threshold_size_mb"] = args.threshold
+        use_s3express = args.s3express or is_s3express_bucket(args.bucket)
+        if use_s3express:
+            overrides["use_s3express"] = True
         run_setup(
             s3_bucket=args.bucket,
             config_overrides=overrides,
             create_vector_table=not args.skip_vector_table,
             build_runtime=not args.skip_runtime,
         )
+        region = args.region or os.getenv("AWS_DEFAULT_REGION") or boto3.Session().region_name or "us-east-1"
+        CONFIG_DIR.mkdir(exist_ok=True)
+        config_data = {"bucket": args.bucket, "region": region}
+        if use_s3express:
+            config_data["s3express"] = True
+            az = parse_express_az(args.bucket)
+            if az:
+                config_data["express_az"] = az
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config_data, f, indent=4)
+        print(f"Configuration saved to {CONFIG_FILE}")
 
     elif args.command == "update-threshold":
         from .infra import update_lambda_threshold
@@ -174,16 +194,24 @@ def main():
 
     elif args.command == "configure":
         CONFIG_DIR.mkdir(exist_ok=True)
+        config_data = {"bucket": args.bucket, "region": args.region}
+        if is_s3express_bucket(args.bucket):
+            config_data["s3express"] = True
+            az = parse_express_az(args.bucket)
+            if az:
+                config_data["express_az"] = az
         with open(CONFIG_FILE, "w") as f:
-            json.dump({"bucket": args.bucket, "region": args.region}, f, indent=4)
+            json.dump(config_data, f, indent=4)
         print(f"Configuration saved to {CONFIG_FILE}")
 
     # ── initialize-database ───────────────────────────────────
     elif args.command == "initialize-database":
         print(f"\n=== Uploading dataset '{args.name}' ===")
 
+        t0 = time.time()
         client.create_dataset(args.name, args.csv_path)
-        print(f"Dataset uploaded.")
+        upload_time = time.time() - t0
+        print(f"Dataset uploaded in {upload_time:.3f}s.")
 
         with open(args.config) as f:
             config = json.load(f)
@@ -192,12 +220,15 @@ def main():
         times = client.index_dataset(
             dataset_name=args.name,
             config=config,
-            num_workers=args.workers
+            num_workers=args.workers,
+            setup_auto_indexer=not args.skip_auto_indexer
         )
+        times["upload_dataset"] = upload_time
         print(f"Index built successfully.")
         print(f"Timing: {json.dumps(times, indent=2)}")
 
-        if not args.no_update_threshold:
+        use_s3express = is_s3express_bucket(bucket) if bucket else False
+        if not args.no_update_threshold and not use_s3express:
             print(f"\n=== Updating auto-indexer threshold ===")
             from .infra import update_lambda_threshold
             update_lambda_threshold(

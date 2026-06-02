@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import boto3
 import numpy as np
 import csv
@@ -28,6 +29,7 @@ from .utils.vector_tracking import VectorIndexTracker
 
 from .serverless_vectordb import ServerlessVectorDB
 from .infra import refresh_lithops_credentials
+from .utils.s3_utils import is_s3express_bucket
 
 class VectorDBClient:
 
@@ -145,7 +147,7 @@ class VectorDBClient:
     def list_indexes(self, dataset_name: str):
         return list_indexes(self.bucket, dataset_name)
     
-    def index_dataset(self, dataset_name: str, config: dict, num_workers: int = 16, save_config: bool = True, track_indexed: bool = True):
+    def index_dataset(self, dataset_name: str, config: dict, num_workers: int = 16, save_config: bool = True, track_indexed: bool = True, setup_auto_indexer: bool = True):
         """
         Run indexing for a dataset using provided configuration.
 
@@ -155,6 +157,8 @@ class VectorDBClient:
             num_workers (int): Number of workers for parallel indexing.
             save_config (bool): If True, saves the index configuration to S3 after indexing.
             track_indexed (bool): If True, tracks indexed vector IDs for hybrid queries.
+            setup_auto_indexer (bool): If True, initializes DynamoDB state and vector tracking for auto-indexer.
+                                       Set False for pure benchmark comparisons.
         Returns:
             dict: Timing stats from the indexing process.
         """
@@ -180,27 +184,35 @@ class VectorDBClient:
         bytes_per_vector = 8 + (features * 8)
         vectors_per_block = total_vectors // num_index
         bytes_per_block = vectors_per_block * bytes_per_vector
+
+        use_s3express = is_s3express_bucket(self.bucket)
         
-        print(f"\nAuto-indexer block size info:")
+        print(f"\nBlock size info:")
         print(f"  Total vectors: {total_vectors:,}")
         print(f"  Features: {features}")
         print(f"  Bytes per vector: {bytes_per_vector}")
         print(f"  Blocks: {num_index}")
         print(f"  Vectors per block: {vectors_per_block:,}")
         print(f"  Bytes per block: {bytes_per_block:,}")
-        print(f"\nTo sync Lambda threshold, run:")
-        print(f"  blocks-db update-threshold {bytes_per_block} --dataset {dataset_name} --bucket {self.bucket}")
-        print(f"  (or just: blocks-db update-threshold --dataset {dataset_name} --bucket {self.bucket} for auto)")
+
+        if not use_s3express:
+            print(f"\nTo sync Lambda threshold, run:")
+            print(f"  blocks-db update-threshold {bytes_per_block} --dataset {dataset_name} --bucket {self.bucket}")
 
         if save_config:
             config["total_vectors"] = total_vectors
             config["bytes_per_vector"] = bytes_per_vector
             config["bytes_per_block"] = bytes_per_block
+            t0 = time.time()
             self.save_index_config(dataset_name, config)
-            self._setup_auto_indexer_state(dataset_name, config)
+            if setup_auto_indexer and not use_s3express:
+                self._setup_auto_indexer_state(dataset_name, config)
+            total_times["save_config"] = time.time() - t0
 
-        if track_indexed:
-            self._track_indexed_vectors_from_csv(dataset_name, features)
+        if track_indexed and setup_auto_indexer:
+            t0 = time.time()
+            self._track_indexed_vectors_from_csv(dataset_name, features, use_s3express=use_s3express)
+            total_times["tracking_time"] = time.time() - t0
 
         return total_times
     
@@ -321,7 +333,7 @@ class VectorDBClient:
         self.tracker.mark_vectors_indexed(dataset_name, pending_ids)
         print(f"Marked {len(pending_ids)} pending vectors as indexed for hybrid search.")
 
-    def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int):
+    def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int, use_s3express: bool = False):
         """Read the main CSV and track all vectors as indexed + build csv_blocks for optimized get."""
         key = f"datasets/{dataset_name}/source.csv"
         indexed_ids = []
@@ -382,11 +394,11 @@ class VectorDBClient:
 
             if indexed_ids:
                 self.tracker.create_indexed_tracking(dataset_name, indexed_ids)
-                # Initialize DynamoDB counter for atomic ID tracking
-                next_id = max(indexed_ids) + 1
-                self.tracker.initialize_next_id(dataset_name, next_id)
                 print(f"Tracked {len(indexed_ids)} vectors as indexed.")
-                print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
+                if not use_s3express:
+                    next_id = max(indexed_ids) + 1
+                    self.tracker.initialize_next_id(dataset_name, next_id)
+                    print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
         except Exception as e:
             print(f"Warning: Could not track indexed vectors: {e}")
 

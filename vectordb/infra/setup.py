@@ -8,6 +8,7 @@ from pathlib import Path
 
 import boto3
 from ..config import DEFAULT_INFRA_CONFIG, get_infra_config as _get_infra_config
+from ..utils.s3_utils import is_s3express_bucket, parse_express_az
 
 
 LITHOPS_CONFIG_DIR = Path.home() / ".lithops"
@@ -398,6 +399,7 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     lambda_function_name = config.get("lambda_function_name")
     runtime_name = config.get("runtime_name")
     threshold_bytes = config.get("threshold_size_bytes")
+    use_s3express = is_s3express_bucket(s3_bucket) or config.get("use_s3express", False)
     
     # template_path not used - setup creates resources manually
     
@@ -405,9 +407,14 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     
     steps = [
         ("Setting up infrastructure", False),
-        ("Building Lambda layer with dependencies", False),
-        ("Creating Lambda with code + layer", False),
-        ("Configuring S3 trigger", False),
+    ]
+    if not use_s3express:
+        steps += [
+            ("Building Lambda layer with dependencies", False),
+            ("Creating Lambda with code + layer", False),
+            ("Configuring S3 trigger", False),
+        ]
+    steps += [
         ("Creating DynamoDB table", False),
         ("Logging into ECR", False),
         ("Generating Lithops config", False),
@@ -429,49 +436,58 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     lambda_arn = None
     execution_role = None
     layer_arn = None
+
+    if use_s3express:
+        az = parse_express_az(s3_bucket)
+        print(f"  S3 Express One Zone detected (AZ: {az})")
+        print(f"  Auto-indexer Lambda skipped — use 'blocks-db initialize-database' for indexing")
     
     steps[0] = (steps[0][0], True)
-    show_progress(1)
-    
-    print("  Building Lambda layer with dependencies...")
-    try:
-        layer_arn = create_faiss_lambda_layer()
-        if layer_arn:
-            print(f"  ✓ Lambda layer created: {layer_arn}")
-        else:
-            print("  ⚠ Could not create Lambda layer")
-    except Exception as e:
-        print(f"  Warning building layer: {e}")
-    
-    steps[1] = (steps[1][0], True)
-    show_progress(2)
-    
-    print("  Creating Lambda with code + layer...")
-    try:
-        lambda_arn = create_lambda_with_code_and_layer(s3_bucket, layer_arn, lambda_function_name)
-        if lambda_arn:
-            print(f"  ✓ Lambda created: {lambda_arn}")
-    except Exception as e:
-        print(f"  Warning creating Lambda: {e}")
-    
-    steps[2] = (steps[2][0], True)
-    show_progress(3)
-    
-    if lambda_arn:
-        print("  Configuring S3 bucket notification...")
+    step_idx = 1
+
+    if not use_s3express:
+        show_progress(step_idx)
+        print("  Building Lambda layer with dependencies...")
         try:
-            configure_s3_notification(s3_bucket, lambda_arn, lambda_function_name)
-            print("  ✓ S3 trigger configured")
+            layer_arn = create_faiss_lambda_layer()
+            if layer_arn:
+                print(f"  ✓ Lambda layer created: {layer_arn}")
+            else:
+                print("  ⚠ Could not create Lambda layer")
         except Exception as e:
-            print(f"  Warning: {e}")
-        steps[3] = (steps[3][0], True)
-    show_progress(4)
+            print(f"  Warning building layer: {e}")
+        steps[step_idx] = (steps[step_idx][0], True)
+        step_idx += 1
+        
+        show_progress(step_idx)
+        print("  Creating Lambda with code + layer...")
+        try:
+            lambda_arn = create_lambda_with_code_and_layer(s3_bucket, layer_arn, lambda_function_name)
+            if lambda_arn:
+                print(f"  ✓ Lambda created: {lambda_arn}")
+        except Exception as e:
+            print(f"  Warning creating Lambda: {e}")
+        steps[step_idx] = (steps[step_idx][0], True)
+        step_idx += 1
+        
+        show_progress(step_idx)
+        if lambda_arn:
+            print("  Configuring S3 bucket notification...")
+            try:
+                configure_s3_notification(s3_bucket, lambda_arn, lambda_function_name)
+                print("  ✓ S3 trigger configured")
+            except Exception as e:
+                print(f"  Warning: {e}")
+        steps[step_idx] = (steps[step_idx][0], True)
+        step_idx += 1
     
+    show_progress(step_idx)
     if create_vector_table:
         print("  Ensuring DynamoDB table exists...")
         create_vector_index_table(s3_bucket)
-        steps[4] = (steps[4][0], True)
-    show_progress(5)
+        steps[step_idx] = (steps[step_idx][0], True)
+    step_idx += 1
+    show_progress(step_idx)
     
     print("  Logging into ECR...")
     try:
@@ -479,13 +495,15 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
         print("  ✓ Logged into ECR")
     except Exception as e:
         print(f"  Warning: {e}")
-    steps[5] = (steps[5][0], True)
-    show_progress(6)
+    steps[step_idx] = (steps[step_idx][0], True)
+    step_idx += 1
+    show_progress(step_idx)
     
     print("  Generating Lithops config...")
     generate_lithops_config(region, s3_bucket, runtime_name, execution_role)
-    steps[6] = (steps[6][0], True)
-    show_progress(7)
+    steps[step_idx] = (steps[step_idx][0], True)
+    step_idx += 1
+    show_progress(step_idx)
     
     if build_runtime:
         dockerfile = Path(__file__).parent / "Dockerfile.lambda"
@@ -497,15 +515,23 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
             except Exception as e:
                 print(f"  Runtime build failed: {e}")
     
-    steps[7] = (steps[7][0], True)
+    steps[step_idx] = (steps[step_idx][0], True)
     show_progress(len(steps) - 1)
     
     print(f"\n✓ Setup complete!")
-    print(f"\nNext steps:")
-    print(f"  1. blocks-db configure --bucket {s3_bucket} --region {region}")
-    print(f"  2. blocks-db initialize-database mydata vectors.csv --config config.json")
-    print(f"  3. blocks-db put mydata new_vectors.csv  (add more vectors)")
-    print(f"  4. blocks-db query mydata --file queries.csv  (search)")
+    next_steps = [
+        f"  1. blocks-db configure --bucket {s3_bucket} --region {region}",
+        f"  2. blocks-db initialize-database mydata vectors.csv --config config.json",
+    ]
+    if not use_s3express:
+        next_steps += [
+            f"  3. blocks-db put mydata new_vectors.csv  (add more vectors)",
+        ]
+    next_steps += [
+        f"  {len(next_steps)+1}. blocks-db query mydata --file queries.csv  (search)",
+    ]
+    for s in next_steps:
+        print(s)
 
 
 def create_lambda_manually(s3_bucket, layer_arn=None, function_name=None):
