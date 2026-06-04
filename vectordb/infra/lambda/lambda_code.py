@@ -1,13 +1,16 @@
 """
 Lambda auto-indexer for Blocks-DB.
 
-This Lambda function is triggered by S3 PUT events on the pending vectors CSV.
-It accumulates vectors until a threshold is reached, then builds a FAISS index.
+Triggered by:
+- S3 Event Notifications (standard buckets)
+- SQS messages (S3 Express One Zone or opt-in buckets)
+
+Accumulates vectors until a threshold is reached, then builds a FAISS index.
 
 Threshold can be set via:
-1. S3 object metadata (x-amz-meta-threshold-mb) - per-upload
-2. Environment variable THRESHOLD_SIZE_MB - default
-3. Event data (threshold_mb in the event json) - per-invocation
+1. S3 object metadata (x-amz-meta-threshold-bytes) - per-upload
+2. Environment variable THRESHOLD_SIZE_BYTES - default
+3. Event data (threshold_bytes in the event json) - per-invocation
 """
 
 import boto3
@@ -34,76 +37,121 @@ _configured_starting_index = None
 
 
 def get_threshold_bytes(event: Dict[str, Any], s3_metadata: Dict[str, str] = None) -> int:
-    """Get threshold in bytes from multiple sources (in priority order):
-    1. Event data (threshold_bytes)
-    2. S3 object metadata (x-amz-meta-threshold-bytes)
-    3. Environment variable THRESHOLD_SIZE_BYTES (DEFAULT_THRESHOLD_BYTES)
-    """
     if event and "threshold_bytes" in event:
         return int(event["threshold_bytes"])
-    
+
     if s3_metadata:
         threshold_meta = s3_metadata.get("threshold-bytes") or s3_metadata.get("threshold_bytes")
         if threshold_meta:
             return int(threshold_meta)
-    
+
     return DEFAULT_THRESHOLD_BYTES
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """Handle S3 PUT events for vector files."""
     table = dynamodb.Table(DYNAMODB_TABLE)
-    
     threshold_bytes = get_threshold_bytes(event)
     print(f"Using threshold: {threshold_bytes:,} bytes")
-    
+
+    if "Records" not in event or not event["Records"]:
+        return {"statusCode": 200, "body": "OK"}
+
+    first = event["Records"][0]
+    if "eventSource" in first and first["eventSource"] == "aws:sqs":
+        return _handle_sqs_event(event, table, threshold_bytes)
+    else:
+        return _handle_s3_event(event, table, threshold_bytes)
+
+
+def _handle_s3_event(event: Dict[str, Any], table, threshold_bytes: int) -> Dict[str, Any]:
     datasets_seen = set()
-    
+
     for record in event.get("Records", []):
         bucket = record["s3"]["bucket"]["name"]
         key = record["s3"]["object"]["key"]
         if not key.endswith(".csv"):
             continue
-        
+
         parts = key.split("/")
         if len(parts) <= 1:
             continue
         dataset = parts[1]
         datasets_seen.add(dataset)
-        
+
         s3_metadata = {}
         try:
             head = s3.head_object(Bucket=bucket, Key=key)
             s3_metadata = head.get("Metadata", {})
         except Exception:
             pass
-        
+
         ensure_global_metadata(table, bucket, dataset)
-        
+
         record_threshold = get_threshold_bytes(event, s3_metadata)
         if record_threshold != threshold_bytes:
             threshold_bytes = record_threshold
-            print(f"Updated threshold from metadata: {threshold_bytes:,} bytes")
-        
+
         try:
-            result = accumulate_file(bucket, key, table)
+            result = accumulate_file(bucket, key, table, s3_metadata=s3_metadata)
             print(f"Accumulated {key}: {result}")
         except Exception as e:
             print(f"Error accumulating {key}: {e}")
             raise
-    
+
+    first_bucket = event["Records"][0]["s3"]["bucket"]["name"] if datasets_seen else None
+    _check_and_index_datasets(datasets_seen, first_bucket, table, threshold_bytes)
+    return {"statusCode": 200, "body": "OK"}
+
+
+def _handle_sqs_event(event: Dict[str, Any], table, threshold_bytes: int) -> Dict[str, Any]:
+    datasets_seen = set()
+    first_bucket = None
+
+    for record in event.get("Records", []):
+        body = json.loads(record["body"])
+        bucket = body["bucket"]
+        key = body["key"]
+        if first_bucket is None:
+            first_bucket = bucket
+
+        if not key.endswith(".csv"):
+            continue
+        parts = key.split("/")
+        if len(parts) <= 1:
+            continue
+        dataset = parts[1]
+        datasets_seen.add(dataset)
+
+        file_size = body.get("file_size")
+        tags = body.get("tags")
+        s3_metadata = {"tags": json.dumps(tags)} if tags else {}
+
+        ensure_global_metadata(table, bucket, dataset)
+
+        try:
+            result = accumulate_file(bucket, key, table, file_size=file_size, s3_metadata=s3_metadata)
+            print(f"Accumulated {key}: {result}")
+        except Exception as e:
+            print(f"Error accumulating {key}: {e}")
+            raise
+
+    _check_and_index_datasets(datasets_seen, first_bucket, table, threshold_bytes)
+    return {"statusCode": 200, "body": "OK"}
+
+
+def _check_and_index_datasets(datasets_seen: set, bucket: str, table, threshold_bytes: int):
     for dataset in datasets_seen:
         pk = f"{dataset}_CONFIG"
         response = table.get_item(Key={"centroid_id": pk, "sk": "META"})
         item = response.get("Item", {})
         total_size = int(item.get("current_accumulated_size", 0))
         current_centroid_id = int(item.get("current_centroid_id", 0))
-        
+
         print(f"[{dataset}] State: centroid_id={current_centroid_id}, accumulated={total_size} bytes, threshold={threshold_bytes}")
-        
+
         if total_size >= threshold_bytes:
             print(f"[{dataset}] Threshold reached, triggering indexing for centroid {current_centroid_id}")
-            
+
             try:
                 response = table.update_item(
                     Key={"centroid_id": pk, "sk": "META"},
@@ -116,10 +164,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     },
                     ReturnValues="ALL_NEW"
                 )
-                
+
                 new_centroid_id = int(response["Attributes"]["current_centroid_id"])
                 print(f"[{dataset}] Claimed centroid {current_centroid_id} (now {new_centroid_id})")
-                
+
                 files = get_files_for_centroid(dataset, current_centroid_id, table)
                 if files:
                     create_index_for_centroid(current_centroid_id, bucket, dataset, table)
@@ -127,28 +175,34 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     print(f"[{dataset}] Index created for centroid {current_centroid_id}")
                 else:
                     print(f"[{dataset}] No files found for centroid {current_centroid_id}")
-                    
+
             except ClientError as e:
                 if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                     print(f"[{dataset}] Another worker already started indexing - skipping")
                 else:
                     raise
-    
-    return {"statusCode": 200, "body": "OK"}
 
 
-def accumulate_file(bucket: str, key: str, table):
-    """Accumulate file size in DynamoDB, carrying over user tags from S3 metadata."""
-    head = s3.head_object(Bucket=bucket, Key=key)
-    file_size = head["ContentLength"]
-    
+def accumulate_file(bucket: str, key: str, table, file_size: int = None, s3_metadata: dict = None):
+    """Accumulate file size in DynamoDB, carrying over user tags.
+
+    Args:
+        file_size: Pre-computed file size (from SQS message). If None, calls s3.head_object().
+        s3_metadata: Pre-fetched S3 metadata (from SQS message). If None, calls s3.head_object().
+    """
     parts = key.split("/")
     dataset_name = parts[1] if len(parts) > 1 else "default"
-    
-    s3_metadata = head.get("Metadata", {})
+
+    if file_size is None or s3_metadata is None:
+        head = s3.head_object(Bucket=bucket, Key=key)
+        if file_size is None:
+            file_size = head["ContentLength"]
+        if s3_metadata is None:
+            s3_metadata = head.get("Metadata", {})
+
     tags_str = s3_metadata.get("tags")
     tags = json.loads(tags_str) if tags_str else None
-    
+
     pk = f"{dataset_name}_CONFIG"
     response = table.update_item(
         Key={"centroid_id": pk, "sk": "META"},
@@ -156,11 +210,11 @@ def accumulate_file(bucket: str, key: str, table):
         ExpressionAttributeValues={":s": file_size, ":zero": 0},
         ReturnValues="ALL_NEW"
     )
-    
+
     attrs = response["Attributes"]
     current_centroid_id = int(attrs.get("current_centroid_id", 0))
     total_size = int(attrs.get("current_accumulated_size", 0))
-    
+
     item = {
         "centroid_id": f"{dataset_name}#{current_centroid_id}",
         "sk": f"FILE#{key}",
@@ -173,16 +227,15 @@ def accumulate_file(bucket: str, key: str, table):
     if tags:
         item["tags"] = json.dumps(tags)
     table.put_item(Item=item)
-    
+
     return {"centroid": current_centroid_id, "total_size": total_size, "dataset": dataset_name}
 
 
 def get_starting_index_from_config(bucket, dataset):
-    """Read num_index from S3 config to determine starting index for auto-indexing."""
     global _configured_starting_index
     if _configured_starting_index is not None:
         return _configured_starting_index
-    
+
     try:
         response = s3.list_objects_v2(Bucket=bucket, Prefix=f"indexes/{dataset}/blocks/")
         for obj in response.get("Contents", []):
@@ -197,18 +250,17 @@ def get_starting_index_from_config(bucket, dataset):
                 return num_index
     except Exception as e:
         print(f"No config found, starting from 0: {e}")
-    
+
     _configured_starting_index = 0
     return 0
 
 
 def ensure_global_metadata(table, bucket=None, dataset=None):
-    """Ensure the per-dataset config item exists with initial values."""
     if not dataset:
         return
     if bucket and _configured_starting_index is None:
         get_starting_index_from_config(bucket, dataset)
-    
+
     pk = f"{dataset}_CONFIG"
     try:
         response = table.update_item(
@@ -227,11 +279,10 @@ def ensure_global_metadata(table, bucket=None, dataset=None):
 
 
 def move_indexed_files_to_processed(bucket: str, table, dataset: str, centroid_id: int):
-    """Delete processed files from pending/ and clean up DynamoDB PENDING tracking entries."""
     files = get_files_for_centroid(dataset, centroid_id, table)
     if not files:
         return
-    
+
     for f in files:
         try:
             source_key = f"{f['prefix']}/{f['file_key']}"
@@ -253,7 +304,6 @@ def move_indexed_files_to_processed(bucket: str, table, dataset: str, centroid_i
 
 
 def save_processed_batch(bucket: str, dataset: str, centroid_id: int, new_ids: List[int], vectors: List[List[float]]) -> None:
-    """Write a batch CSV with corrected IDs to processed/."""
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(["id", "vector"])
@@ -266,17 +316,16 @@ def save_processed_batch(bucket: str, dataset: str, centroid_id: int, new_ids: L
 
 
 def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table) -> None:
-    """Build and store FAISS index for a centroid."""
     files = get_files_for_centroid(dataset, centroid_id, table)
-    
+
     if not files:
         print(f"No files found for centroid {centroid_id}")
         return
-    
+
     original_ids = []
     vectors = []
     features = None
-    
+
     start = time.time()
     for f in files:
         key = f"{f['prefix']}/{f['file_key']}"
@@ -304,32 +353,31 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
                 vectors.append(vec)
         except Exception as e:
             print(f"Error reading file {key}: {e}")
-    
+
     load_time = time.time() - start
     print(f"Loaded {len(vectors)} vectors in {load_time:.2f}s")
-    
+
     if not vectors or features is None:
         return
-    
-    # Use atomic DynamoDB counter to get and reserve IDs
+
     next_available_id = get_next_available_id_atomic(bucket, dataset, len(original_ids))
     new_ids = list(range(next_available_id, next_available_id + len(original_ids)))
     print(f"Reassigning IDs: {len(original_ids)} vectors from IDs {min(original_ids)}-{max(original_ids)} to {next_available_id}-{next_available_id + len(new_ids) - 1}")
-    
+
     start = time.time()
     k = max(1, min(4096, len(vectors) // 4))
     n_probe = min(1024, k)
-    
+
     index = faiss.index_factory(features, f"IVF{k},Flat")
     index.train(np.array(vectors, dtype="float32"))
     index.nprobe = n_probe
     index.add_with_ids(np.array(vectors, dtype="float32"), np.array(new_ids))
     train_time = time.time() - start
     print(f"Built index in {train_time:.2f}s")
-    
+
     start = time.time()
     faiss.write_index(index, f"/tmp/c{centroid_id}.ann")
-    
+
     s3.upload_file(
         f"/tmp/c{centroid_id}.ann",
         bucket,
@@ -337,18 +385,17 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
     )
     store_time = time.time() - start
     print(f"Stored index at indexes/{dataset}/{INDEX_IMPLEMENTATION}/centroid_{centroid_id}.ann in {store_time:.2f}s")
-    
+
     update_indexed_tracking(bucket, dataset, new_ids)
 
     save_processed_batch(bucket, dataset, centroid_id, new_ids, vectors)
-    
+
     update_config_num_index(bucket, dataset, centroid_id + 1)
 
     save_centroid_tags(centroid_id, dataset, files, table)
 
 
 def save_centroid_tags(centroid_id: int, dataset: str, files: List[Dict], table):
-    """Aggregate user tags from all files in a centroid and store as a META item."""
     aggregated = {}
     for f in files:
         raw_tags = f.get("tags")
@@ -384,7 +431,6 @@ def save_centroid_tags(centroid_id: int, dataset: str, files: List[Dict], table)
 
 
 def update_config_num_index(bucket: str, dataset: str, num_index: int):
-    """Update num_index in S3 config after creating a new index block."""
     config_key = f"indexes/{dataset}/{INDEX_IMPLEMENTATION}/config.json"
     try:
         existing = s3.get_object(Bucket=bucket, Key=config_key)
@@ -392,7 +438,7 @@ def update_config_num_index(bucket: str, dataset: str, num_index: int):
     except Exception as e:
         print(f"No existing config to update: {e}")
         return
-    
+
     old_num_index = config.get("num_index", 0)
     if num_index > old_num_index:
         config["num_index"] = num_index
@@ -408,15 +454,13 @@ def update_config_num_index(bucket: str, dataset: str, num_index: int):
 
 
 def get_next_available_id_atomic(bucket: str, dataset: str, count: int) -> int:
-    """Atomically get and reserve the next `count` IDs from DynamoDB. Returns the starting ID."""
     global dynamodb
     if isinstance(dynamodb, boto3.resources.factory.ServiceResource):
         table = dynamodb.Table(DYNAMODB_TABLE)
     else:
-        # Re-initialize if needed
         dynamodb = boto3.resource("dynamodb")
         table = dynamodb.Table(DYNAMODB_TABLE)
-    
+
     try:
         response = table.update_item(
             Key={"centroid_id": f"{dataset}_ID_TRACKER", "sk": "META"},
@@ -424,8 +468,6 @@ def get_next_available_id_atomic(bucket: str, dataset: str, count: int) -> int:
             ExpressionAttributeValues={":inc": count, ":zero": 0},
             ReturnValues="ALL_NEW"
         )
-        # Return the starting ID (value after increment minus count)
-        # Convert Decimal to int since DynamoDB returns Decimal type
         return int(response["Attributes"]["next_id"] - count)
     except Exception as e:
         print(f"Error getting next ID atomically: {e}")
@@ -433,7 +475,6 @@ def get_next_available_id_atomic(bucket: str, dataset: str, count: int) -> int:
 
 
 def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
-    """Track indexed vector IDs in S3 for status commands (optional with atomic DynamoDB counter)."""
     key = f"tracking/indexed_ids_{dataset}.json"
     try:
         existing = s3.get_object(Bucket=bucket, Key=key)
@@ -442,7 +483,6 @@ def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
     except:
         indexed_set = set()
 
-    # IDs are already reassigned by create_index_for_centroid()
     indexed_set.update(ids)
 
     import orjson
@@ -457,20 +497,19 @@ def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
 
 
 def get_files_for_centroid(dataset: str, centroid_id: int, table) -> List[Dict]:
-    """Query DynamoDB for all files in a centroid."""
     files = []
     done = False
     start_key = None
-    
+
     while not done:
         kwargs = {"KeyConditionExpression": "centroid_id = :cid"}
         kwargs["ExpressionAttributeValues"] = {":cid": f"{dataset}#{centroid_id}"}
         if start_key:
             kwargs["ExclusiveStartKey"] = start_key
-        
+
         response = table.query(**kwargs)
         files.extend(response.get("Items", []))
         start_key = response.get("LastEvaluatedKey")
         done = start_key is None
-    
+
     return files

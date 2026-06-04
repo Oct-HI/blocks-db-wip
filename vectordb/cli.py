@@ -47,7 +47,8 @@ def main():
     setup_parser.add_argument("--threshold", type=int, default=None, help="Auto-indexer threshold in bytes (default: 5242880)")
     setup_parser.add_argument("--skip-vector-table", action="store_true", help="Skip DynamoDB table creation")
     setup_parser.add_argument("--skip-runtime", action="store_true", help="Skip Lithops runtime build")
-    setup_parser.add_argument("--s3express", action="store_true", help="Use S3 Express One Zone (skips auto-indexer Lambda)")
+    setup_parser.add_argument("--s3express", action="store_true", help="Use S3 Express One Zone (auto-enables SQS)")
+    setup_parser.add_argument("--sqs", action="store_true", help="Use SQS instead of S3 notifications for auto-indexer trigger")
 
     # ── update-threshold ─────────────────────────────────────
     threshold_parser = subparsers.add_parser("update-threshold", help="Update auto-indexer block size threshold")
@@ -64,6 +65,7 @@ def main():
     configure_parser = subparsers.add_parser("configure", help="Save default bucket and region")
     configure_parser.add_argument("--bucket", required=True, help="Default S3 bucket")
     configure_parser.add_argument("--region", default="us-east-1", help="AWS region")
+    configure_parser.add_argument("--sqs", action="store_true", help="Use SQS for auto-indexer notifications")
 
     # ── initialize-database ───────────────────────────────────
     init_parser = subparsers.add_parser("initialize-database", help="Upload initial dataset and create index")
@@ -132,9 +134,10 @@ def main():
             "Bucket not provided. Use --bucket, set SVDB_BUCKET, or run 'blocks-db configure'."
         )
 
+    sqs_queue_url = file_config.get("sqs_queue_url")
     client = None
     if args.command not in commands_without_bucket:
-        client = VectorDBClient(bucket=bucket, region=region)
+        client = VectorDBClient(bucket=bucket, region=region, sqs_queue_url=sqs_queue_url)
 
     def _fmt_result(r):
         if len(r) == 3:
@@ -157,8 +160,11 @@ def main():
         if args.threshold:
             overrides["threshold_size_mb"] = args.threshold
         use_s3express = args.s3express or is_s3express_bucket(args.bucket)
+        use_sqs = args.sqs or use_s3express
         if use_s3express:
             overrides["use_s3express"] = True
+        if use_sqs:
+            overrides["sqs_use_sqs"] = True
         run_setup(
             s3_bucket=args.bucket,
             config_overrides=overrides,
@@ -173,6 +179,15 @@ def main():
             az = parse_express_az(args.bucket)
             if az:
                 config_data["express_az"] = az
+        if use_sqs:
+            config_data["use_sqs"] = True
+            sqs_queue_name = overrides.get("sqs_queue_name", f"blocksdb-pending-{args.bucket.replace('.', '-')}")
+            try:
+                sqs = boto3.client("sqs", region_name=region)
+                sqs_queue_url = sqs.get_queue_url(QueueName=sqs_queue_name)["QueueUrl"]
+                config_data["sqs_queue_url"] = sqs_queue_url
+            except Exception:
+                pass
         with open(CONFIG_FILE, "w") as f:
             json.dump(config_data, f, indent=4)
         print(f"Configuration saved to {CONFIG_FILE}")
@@ -194,12 +209,23 @@ def main():
 
     elif args.command == "configure":
         CONFIG_DIR.mkdir(exist_ok=True)
+        use_s3express = is_s3express_bucket(args.bucket)
+        use_sqs = args.sqs or use_s3express
         config_data = {"bucket": args.bucket, "region": args.region}
-        if is_s3express_bucket(args.bucket):
+        if use_s3express:
             config_data["s3express"] = True
             az = parse_express_az(args.bucket)
             if az:
                 config_data["express_az"] = az
+        if use_sqs:
+            config_data["use_sqs"] = True
+            sqs_queue_name = f"blocksdb-pending-{args.bucket.replace('.', '-')}"
+            try:
+                sqs = boto3.client("sqs", region_name=args.region)
+                sqs_queue_url = sqs.get_queue_url(QueueName=sqs_queue_name)["QueueUrl"]
+                config_data["sqs_queue_url"] = sqs_queue_url
+            except Exception:
+                pass
         with open(CONFIG_FILE, "w") as f:
             json.dump(config_data, f, indent=4)
         print(f"Configuration saved to {CONFIG_FILE}")
@@ -228,7 +254,7 @@ def main():
         print(f"Timing: {json.dumps(times, indent=2)}")
 
         use_s3express = is_s3express_bucket(bucket) if bucket else False
-        if not args.no_update_threshold and not use_s3express:
+        if not args.no_update_threshold:
             print(f"\n=== Updating auto-indexer threshold ===")
             from .infra import update_lambda_threshold
             update_lambda_threshold(

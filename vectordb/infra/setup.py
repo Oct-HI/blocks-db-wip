@@ -384,6 +384,126 @@ def ecr_login(region):
         print("Logged into ECR successfully.")
 
 
+def create_sqs_queue(queue_name, region=None):
+    """Create SQS queue with DLQ for auto-indexer notifications."""
+    sqs = boto3.client("sqs", region_name=region) if region else boto3.client("sqs")
+    dlq_name = f"{queue_name}-dlq"
+
+    dlq_url = None
+    try:
+        dlq = sqs.create_queue(
+            QueueName=dlq_name,
+            Attributes={
+                "MessageRetentionPeriod": "1209600",  # 14 days
+            }
+        )
+        dlq_url = dlq["QueueUrl"]
+        dlq_arn = sqs.get_queue_attributes(QueueUrl=dlq_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        print(f"  ✓ DLQ created: {dlq_name}")
+    except sqs.exceptions.QueueNameExists:
+        dlq_url = sqs.get_queue_url(QueueName=dlq_name)["QueueUrl"]
+        dlq_arn = sqs.get_queue_attributes(QueueUrl=dlq_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        print(f"  DLQ already exists: {dlq_name}")
+
+    redrive_policy = json.dumps({
+        "deadLetterTargetArn": dlq_arn,
+        "maxReceiveCount": 3
+    })
+
+    try:
+        queue = sqs.create_queue(
+            QueueName=queue_name,
+            Attributes={
+                "VisibilityTimeout": "900",
+                "MessageRetentionPeriod": "1209600",
+                "ReceiveMessageWaitTimeSeconds": "20",
+                "RedrivePolicy": redrive_policy,
+            }
+        )
+        queue_url = queue["QueueUrl"]
+        print(f"  ✓ SQS queue created: {queue_name}")
+    except sqs.exceptions.QueueNameExists:
+        queue_url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+        sqs.set_queue_attributes(QueueUrl=queue_url, Attributes={"RedrivePolicy": redrive_policy})
+        print(f"  SQS queue already exists: {queue_name}")
+
+    queue_arn = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    return queue_url, queue_arn
+
+
+def configure_sqs_lambda_trigger(lambda_arn, queue_arn, batch_size=10, batch_window=5, region=None):
+    """Create event source mapping from SQS to Lambda."""
+    lambda_client = boto3.client("lambda", region_name=region) if region else boto3.client("lambda")
+
+    existing = lambda_client.list_event_source_mappings(
+        FunctionName=lambda_arn,
+        EventSourceArn=queue_arn,
+    )
+    for mapping in existing.get("EventSourceMappings", []):
+        if mapping["State"] == "Enabled":
+            print(f"  SQS→Lambda mapping already exists (UUID: {mapping['UUID']})")
+            return mapping["UUID"]
+
+    response = lambda_client.create_event_source_mapping(
+        EventSourceArn=queue_arn,
+        FunctionName=lambda_arn,
+        Enabled=True,
+        BatchSize=batch_size,
+        MaximumBatchingWindowInSeconds=batch_window,
+    )
+    uuid = response["UUID"]
+    print(f"  ✓ SQS→Lambda event source mapping created (UUID: {uuid}, batch={batch_size}, window={batch_window}s)")
+    return uuid
+
+
+def add_sqs_policy_to_role(role_name, queue_arn, region=None):
+    """Attach inline policy granting SQS permissions to the Lambda role."""
+    iam = boto3.client("iam")
+    policy_name = "blocksdb-sqs-policy"
+    policy_doc = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes",
+            ],
+            "Resource": queue_arn
+        }]
+    }
+    try:
+        iam.put_role_policy(
+            RoleName=role_name,
+            PolicyName=policy_name,
+            PolicyDocument=json.dumps(policy_doc),
+        )
+        print(f"  ✓ SQS policy attached to role '{role_name}'")
+    except Exception as e:
+        print(f"  Warning attaching SQS policy: {e}")
+
+
+def add_s3express_bucket_policy(role_name, bucket_name, region=None):
+    """Attach inline policy granting s3express:CreateSession to the Lambda role."""
+    iam = boto3.client("iam")
+    sts = boto3.client("sts")
+    account_id = sts.get_caller_identity()["Account"]
+    bucket_arn = f"arn:aws:s3express:{region or 'us-east-1'}:{account_id}:bucket/{bucket_name}"
+    policy_doc = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "s3express:CreateSession",
+            "Resource": bucket_arn
+        }]
+    }
+    iam.put_role_policy(
+        RoleName=role_name,
+        PolicyName="blocksdb-s3express-policy",
+        PolicyDocument=json.dumps(policy_doc),
+    )
+
+
 def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_runtime=True):
     """
     Setup Blocks-DB infrastructure.
@@ -400,15 +520,27 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     runtime_name = config.get("runtime_name")
     threshold_bytes = config.get("threshold_size_bytes")
     use_s3express = is_s3express_bucket(s3_bucket) or config.get("use_s3express", False)
-    
+    use_sqs = config.get("sqs_use_sqs", False) or use_s3express
+
     # template_path not used - setup creates resources manually
-    
+
     region = boto3.Session().region_name or "us-east-1"
-    
+
+    if "sqs_queue_name" not in (config_overrides or {}):
+        config["sqs_queue_name"] = f"blocksdb-pending-{s3_bucket.replace('.', '-')}"
+    sqs_queue_name = config["sqs_queue_name"]
+
     steps = [
         ("Setting up infrastructure", False),
     ]
-    if not use_s3express:
+    if use_sqs:
+        steps += [
+            ("Building Lambda layer with dependencies", False),
+            ("Creating Lambda with code + layer", False),
+            ("Creating SQS queue and DLQ", False),
+            ("Configuring SQS → Lambda trigger", False),
+        ]
+    elif not use_s3express:
         steps += [
             ("Building Lambda layer with dependencies", False),
             ("Creating Lambda with code + layer", False),
@@ -436,16 +568,19 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     lambda_arn = None
     execution_role = None
     layer_arn = None
+    sqs_queue_url = None
 
-    if use_s3express:
-        az = parse_express_az(s3_bucket)
-        print(f"  S3 Express One Zone detected (AZ: {az})")
-        print(f"  Auto-indexer Lambda skipped — use 'blocks-db initialize-database' for indexing")
-    
+    if use_sqs:
+        az = parse_express_az(s3_bucket) if use_s3express else None
+        if az:
+            print(f"  S3 Express One Zone detected (AZ: {az}) — using SQS for auto-indexer")
+        else:
+            print(f"  SQS-based auto-indexer enabled")
+
     steps[0] = (steps[0][0], True)
     step_idx = 1
 
-    if not use_s3express:
+    if use_sqs or not use_s3express:
         show_progress(step_idx)
         print("  Building Lambda layer with dependencies...")
         try:
@@ -458,7 +593,7 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
             print(f"  Warning building layer: {e}")
         steps[step_idx] = (steps[step_idx][0], True)
         step_idx += 1
-        
+
         show_progress(step_idx)
         print("  Creating Lambda with code + layer...")
         try:
@@ -469,15 +604,56 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
             print(f"  Warning creating Lambda: {e}")
         steps[step_idx] = (steps[step_idx][0], True)
         step_idx += 1
-        
+
         show_progress(step_idx)
         if lambda_arn:
-            print("  Configuring S3 bucket notification...")
-            try:
-                configure_s3_notification(s3_bucket, lambda_arn, lambda_function_name)
-                print("  ✓ S3 trigger configured")
-            except Exception as e:
-                print(f"  Warning: {e}")
+            if use_sqs:
+                print("  Creating SQS queue and DLQ...")
+                try:
+                    sqs_queue_url, sqs_queue_arn = create_sqs_queue(sqs_queue_name, region)
+                    print(f"  ✓ SQS queue: {sqs_queue_url}")
+                except Exception as e:
+                    print(f"  Warning: {e}")
+                steps[step_idx] = (steps[step_idx][0], True)
+                step_idx += 1
+
+                print("  Attaching SQS permissions to Lambda role...")
+                lambda_role_name = config.get("lambda_role_name", f"{lambda_function_name}-role")
+                try:
+                    add_sqs_policy_to_role(lambda_role_name, sqs_queue_arn)
+                    print(f"  ✓ SQS policy attached to role '{lambda_role_name}'")
+                except Exception as e:
+                    print(f"  Warning attaching SQS policy: {e}")
+
+                if use_s3express:
+                    try:
+                        add_s3express_bucket_policy(lambda_role_name, s3_bucket, region)
+                        print(f"  ✓ S3 Express policy attached to role '{lambda_role_name}'")
+                    except Exception as e:
+                        print(f"  Warning attaching S3 Express policy: {e}")
+
+                print("  Waiting for IAM propagation...")
+                time.sleep(10)
+
+                show_progress(step_idx)
+                print("  Configuring SQS → Lambda trigger...")
+                try:
+                    configure_sqs_lambda_trigger(
+                        lambda_arn, sqs_queue_arn,
+                        batch_size=config.get("sqs_batch_size", 10),
+                        batch_window=config.get("sqs_batch_window", 5),
+                        region=region,
+                    )
+                    print("  ✓ SQS → Lambda trigger configured")
+                except Exception as e:
+                    print(f"  Warning: {e}")
+            else:
+                print("  Configuring S3 bucket notification...")
+                try:
+                    configure_s3_notification(s3_bucket, lambda_arn, lambda_function_name)
+                    print("  ✓ S3 trigger configured")
+                except Exception as e:
+                    print(f"  Warning: {e}")
         steps[step_idx] = (steps[step_idx][0], True)
         step_idx += 1
     
@@ -523,7 +699,7 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
         f"  1. blocks-db configure --bucket {s3_bucket} --region {region}",
         f"  2. blocks-db initialize-database mydata vectors.csv --config config.json",
     ]
-    if not use_s3express:
+    if use_sqs or not use_s3express:
         next_steps += [
             f"  3. blocks-db put mydata new_vectors.csv  (add more vectors)",
         ]
@@ -532,6 +708,9 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     ]
     for s in next_steps:
         print(s)
+
+    if use_sqs and sqs_queue_url:
+        print(f"\n  SQS Queue: {sqs_queue_url}")
 
 
 def create_lambda_manually(s3_bucket, layer_arn=None, function_name=None):

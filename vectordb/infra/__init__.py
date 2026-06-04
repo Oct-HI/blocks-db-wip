@@ -7,6 +7,9 @@ from .setup import (
     deploy_lambda_code,
     create_lambda_with_code_and_layer,
     get_infra_config,
+    create_sqs_queue,
+    configure_sqs_lambda_trigger,
+    add_sqs_policy_to_role,
 )
 
 __all__ = [
@@ -18,4 +21,7 @@ __all__ = [
     "deploy_lambda_code",
     "create_lambda_with_code_and_layer",
     "get_infra_config",
+    "create_sqs_queue",
+    "configure_sqs_lambda_trigger",
+    "add_sqs_policy_to_role",
 ]

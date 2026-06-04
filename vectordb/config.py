@@ -12,6 +12,11 @@ class InfraConfig:
     layer_name: str = "blocksdb-layer-faiss-default"
     threshold_size_bytes: int = 5242880  # 5 MB
     runtime_name: str = "blocks-db-runtime"
+    sqs_use_sqs: bool = False
+    sqs_queue_name: str = "blocksdb-pending-default"
+    sqs_queue_url: str = None
+    sqs_batch_size: int = 10
+    sqs_batch_window: int = 5
 
 
 DEFAULT_INFRA_CONFIG = InfraConfig()

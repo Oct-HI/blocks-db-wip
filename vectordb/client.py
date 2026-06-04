@@ -33,15 +33,16 @@ from .utils.s3_utils import is_s3express_bucket
 
 class VectorDBClient:
 
-    def __init__(self, bucket: str, region: str = None):
+    def __init__(self, bucket: str, region: str = None, sqs_queue_url: str = None):
         self.bucket = bucket
+        self.sqs_queue_url = sqs_queue_url
 
         if region:
             self.s3 = boto3.client("s3", region_name=region)
         else:
             self.s3 = boto3.client("s3")
-        
-        self.tracker = VectorIndexTracker(bucket, region)
+
+        self.tracker = VectorIndexTracker(bucket, region, sqs_queue_url=sqs_queue_url)
 
     def create_dataset(self, name: str, csv_path: str):
         """
@@ -205,7 +206,7 @@ class VectorDBClient:
             config["bytes_per_block"] = bytes_per_block
             t0 = time.time()
             self.save_index_config(dataset_name, config)
-            if setup_auto_indexer and not use_s3express:
+            if setup_auto_indexer:
                 self._setup_auto_indexer_state(dataset_name, config)
             total_times["save_config"] = time.time() - t0
 
@@ -395,10 +396,9 @@ class VectorDBClient:
             if indexed_ids:
                 self.tracker.create_indexed_tracking(dataset_name, indexed_ids)
                 print(f"Tracked {len(indexed_ids)} vectors as indexed.")
-                if not use_s3express:
-                    next_id = max(indexed_ids) + 1
-                    self.tracker.initialize_next_id(dataset_name, next_id)
-                    print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
+                next_id = max(indexed_ids) + 1
+                self.tracker.initialize_next_id(dataset_name, next_id)
+                print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
         except Exception as e:
             print(f"Warning: Could not track indexed vectors: {e}")
 
