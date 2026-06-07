@@ -7,7 +7,7 @@ from pathlib import Path
 
 import boto3
 
-from .client import VectorDBClient
+from .client import VectorDBClient, build_csv_blocks_from_local
 from .infra import run_setup, refresh_lithops_credentials, get_infra_config
 from .config import DEFAULT_INFRA_CONFIG
 from .utils.s3_utils import is_s3express_bucket, parse_express_az
@@ -75,6 +75,7 @@ def main():
     init_parser.add_argument("--workers", type=int, default=16, help="Number of indexing workers")
     init_parser.add_argument("--no-update-threshold", action="store_true", help="Skip auto-update threshold after indexing")
     init_parser.add_argument("--skip-auto-indexer", action="store_true", help="Skip DynamoDB state init and vector tracking (for pure benchmarks)")
+    init_parser.add_argument("--build-local", action="store_true", help="Build csv_blocks from local file (skip S3 re-download during tracking)")
 
     # ── put ───────────────────────────────────────────────────
     put_parser = subparsers.add_parser("put", help="Add new vectors (stored as individual files)")
@@ -234,6 +235,14 @@ def main():
     elif args.command == "initialize-database":
         print(f"\n=== Uploading dataset '{args.name}' ===")
 
+        csv_blocks = None
+        if args.build_local:
+            t0 = time.time()
+            csv_blocks = build_csv_blocks_from_local(args.csv_path)
+            local_build_time = time.time() - t0
+            blocks, last_vid = csv_blocks
+            print(f"Built {len(blocks)} csv_blocks from local file (last_vid={last_vid}) in {local_build_time:.3f}s.")
+
         t0 = time.time()
         client.create_dataset(args.name, args.csv_path)
         upload_time = time.time() - t0
@@ -247,7 +256,8 @@ def main():
             dataset_name=args.name,
             config=config,
             num_workers=args.workers,
-            setup_auto_indexer=not args.skip_auto_indexer
+            setup_auto_indexer=not args.skip_auto_indexer,
+            csv_blocks=csv_blocks
         )
         times["upload_dataset"] = upload_time
         print(f"Index built successfully.")

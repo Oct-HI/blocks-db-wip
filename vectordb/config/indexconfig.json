@@ -9,7 +9,7 @@
   "implementation": "blocks",
 
   "replication": 1.0,
-  "num_index": 16,
+  "num_index": 32,
   "num_centroids_search": 4,
   "k": 512,
   "n_probe": 32,

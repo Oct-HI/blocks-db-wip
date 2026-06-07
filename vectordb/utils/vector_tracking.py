@@ -16,8 +16,9 @@ from .s3_client import s3
 class VectorIndexTracker:
     DYNAMODB_TABLE_NAME = "BlocksDB-default"
 
-    def __init__(self, bucket: str, region: str = None):
+    def __init__(self, bucket: str, region: str = None, sqs_queue_url: str = None):
         self.bucket = bucket
+        self.sqs_queue_url = sqs_queue_url
         if region:
             self.dynamodb = boto3.resource("dynamodb", region_name=region)
             self.s3 = boto3.client("s3", region_name=region)
@@ -25,6 +26,8 @@ class VectorIndexTracker:
             self.dynamodb = boto3.resource("dynamodb")
             self.s3 = boto3.client("s3")
         self.table = self.dynamodb.Table(self.DYNAMODB_TABLE_NAME)
+        if sqs_queue_url:
+            self.sqs = boto3.client("sqs", region_name=region) if region else boto3.client("sqs")
 
     def get_indexed_files_key(self, dataset_name: str) -> str:
         return f"indexed_files_{dataset_name}.json"
@@ -83,7 +86,7 @@ class VectorIndexTracker:
                 Key={"centroid_id": f"{dataset_name}_ID_TRACKER", "sk": "META"}
             )
             item = response.get("Item", {})
-            return item.get("next_id", 0)
+            return int(item.get("next_id", 0))
         except Exception as e:
             print(f"Error reading next_id from DynamoDB: {e}")
             return 0
@@ -106,10 +109,24 @@ class VectorIndexTracker:
         if tags:
             extra_args["Metadata"] = {"tags": json.dumps(tags)}
         s3.put_object(Bucket=self.bucket, Key=key, Body=csv_bytes, **extra_args)
-        
+
+        if self.sqs_queue_url:
+            try:
+                self.sqs.send_message(
+                    QueueUrl=self.sqs_queue_url,
+                    MessageBody=json.dumps({
+                        "bucket": self.bucket,
+                        "key": key,
+                        "file_size": len(csv_bytes),
+                        "tags": tags,
+                    })
+                )
+            except Exception as e:
+                print(f"SQS notification error (non-fatal): {e}")
+
         new_ids = [v[0] for v in vectors]
         self._update_pending_tracking(dataset_name, new_ids, key, tags)
-        
+
         return key
 
     def put_vector(self, dataset_name: str, vector_id: int, vector: List[float], tags: dict = None) -> str:

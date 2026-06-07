@@ -28,6 +28,55 @@ from .utils.vector_tracking import VectorIndexTracker
 
 
 from .serverless_vectordb import ServerlessVectorDB
+
+BLOCK_SIZE = 500000  # ~500KB per block for CSV blocks
+
+
+def build_csv_blocks_from_local(csv_path: str):
+    """Read a local CSV file and build csv_blocks (byte-offset chunks) + last_vid.
+
+    Returns (blocks, last_vid).
+    """
+    blocks = []
+    current_offset = 0
+    current_block_start_id = None
+    current_block_size = 0
+    last_vid = None
+
+    with open(csv_path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            id_str = line.split(",")[0]
+            vec_id = int(id_str)
+
+            if current_block_start_id is None:
+                current_block_start_id = vec_id
+
+            current_block_size += len(line) + 1
+
+            if current_block_size >= BLOCK_SIZE:
+                blocks.append({
+                    "start_id": current_block_start_id,
+                    "end_id": vec_id,
+                    "offset": current_offset,
+                    "size": current_block_size
+                })
+                current_offset += current_block_size
+                current_block_start_id = None
+                current_block_size = 0
+
+            last_vid = vec_id
+
+    if current_block_start_id is not None and last_vid is not None:
+        blocks.append({
+            "start_id": current_block_start_id,
+            "end_id": last_vid,
+            "offset": current_offset,
+            "size": current_block_size
+        })
+
+    return blocks, last_vid
 from .infra import refresh_lithops_credentials
 from .utils.s3_utils import is_s3express_bucket
 
@@ -148,7 +197,7 @@ class VectorDBClient:
     def list_indexes(self, dataset_name: str):
         return list_indexes(self.bucket, dataset_name)
     
-    def index_dataset(self, dataset_name: str, config: dict, num_workers: int = 16, save_config: bool = True, track_indexed: bool = True, setup_auto_indexer: bool = True):
+    def index_dataset(self, dataset_name: str, config: dict, num_workers: int = 16, save_config: bool = True, track_indexed: bool = True, setup_auto_indexer: bool = True, csv_blocks: tuple = None):
         """
         Run indexing for a dataset using provided configuration.
 
@@ -160,6 +209,8 @@ class VectorDBClient:
             track_indexed (bool): If True, tracks indexed vector IDs for hybrid queries.
             setup_auto_indexer (bool): If True, initializes DynamoDB state and vector tracking for auto-indexer.
                                        Set False for pure benchmark comparisons.
+            csv_blocks (tuple, optional): (blocks, last_vid) pre-built from local file.
+                                          If provided, avoids re-downloading CSV from S3.
         Returns:
             dict: Timing stats from the indexing process.
         """
@@ -212,7 +263,7 @@ class VectorDBClient:
 
         if track_indexed and setup_auto_indexer:
             t0 = time.time()
-            self._track_indexed_vectors_from_csv(dataset_name, features, use_s3express=use_s3express)
+            self._track_indexed_vectors_from_csv(dataset_name, features, use_s3express=use_s3express, prebuilt_blocks=csv_blocks)
             total_times["tracking_time"] = time.time() - t0
 
         return total_times
@@ -334,10 +385,26 @@ class VectorDBClient:
         self.tracker.mark_vectors_indexed(dataset_name, pending_ids)
         print(f"Marked {len(pending_ids)} pending vectors as indexed for hybrid search.")
 
-    def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int, use_s3express: bool = False):
-        """Read the main CSV and track all vectors as indexed + build csv_blocks for optimized get."""
+    def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int, use_s3express: bool = False, prebuilt_blocks: tuple = None):
+        """Read the main CSV and track all vectors as indexed + build csv_blocks for optimized get.
+
+        If prebuilt_blocks=(blocks, last_vid) is provided, skip S3 download
+        and use the pre-built blocks instead.
+        """
+        if prebuilt_blocks is not None:
+            blocks, last_vid = prebuilt_blocks
+            if blocks:
+                blocks_key = f"tracking/csv_blocks_{dataset_name}.json"
+                self.s3.put_object(Bucket=self.bucket, Key=blocks_key, Body=json.dumps(blocks))
+                print(f"Stored {len(blocks)} pre-built CSV blocks for optimized get.")
+            if last_vid is not None:
+                next_id = last_vid + 1
+                self.tracker.initialize_next_id(dataset_name, next_id)
+                print(f"Tracked {next_id} vectors as indexed (from local file).")
+                print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
+            return
+
         key = f"datasets/{dataset_name}/source.csv"
-        indexed_ids = []
         block_size = 500000  # ~500KB per block
         blocks = []
 
@@ -360,7 +427,6 @@ class VectorDBClient:
                 line = raw_line.decode()
                 id_str = line.split(",")[0]
                 vec_id = int(id_str)
-                indexed_ids.append(vec_id)
 
                 if current_block_start_id is None:
                     current_block_start_id = vec_id
@@ -393,11 +459,10 @@ class VectorDBClient:
                 self.s3.put_object(Bucket=self.bucket, Key=blocks_key, Body=json.dumps(blocks))
                 print(f"Built {len(blocks)} CSV blocks for optimized get.")
 
-            if indexed_ids:
-                self.tracker.create_indexed_tracking(dataset_name, indexed_ids)
-                print(f"Tracked {len(indexed_ids)} vectors as indexed.")
-                next_id = max(indexed_ids) + 1
+            if last_vid is not None:
+                next_id = last_vid + 1
                 self.tracker.initialize_next_id(dataset_name, next_id)
+                print(f"Tracked {next_id} vectors as indexed.")
                 print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
         except Exception as e:
             print(f"Warning: Could not track indexed vectors: {e}")

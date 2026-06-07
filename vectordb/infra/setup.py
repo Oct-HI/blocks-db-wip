@@ -636,6 +636,9 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
                 time.sleep(10)
 
                 show_progress(step_idx)
+                print("  Removing any existing S3 bucket notification (prevents duplicate triggers)...")
+                remove_s3_notification(s3_bucket)
+
                 print("  Configuring SQS → Lambda trigger...")
                 try:
                     configure_sqs_lambda_trigger(
@@ -1081,6 +1084,19 @@ def deploy_lambda_code(function_name=None):
         return None
 
 
+
+
+def remove_s3_notification(s3_bucket):
+    """Remove any S3 bucket notification configuration to avoid duplicate triggers."""
+    s3_client = boto3.client("s3")
+    try:
+        s3_client.put_bucket_notification_configuration(
+            Bucket=s3_bucket,
+            NotificationConfiguration={}
+        )
+        print(f"  Removed S3 notification configuration from bucket: {s3_bucket}")
+    except Exception as e:
+        print(f"  Warning: Could not remove S3 notification: {e}")
 
 
 def configure_s3_notification(s3_bucket, lambda_arn, function_name=None):
