@@ -16,7 +16,7 @@ class InfraConfig:
     sqs_queue_name: str = "blocksdb-pending-default"
     sqs_queue_url: str = None
     sqs_batch_size: int = 10
-    sqs_batch_window: int = 5
+    sqs_batch_window: int = 0
 
 
 DEFAULT_INFRA_CONFIG = InfraConfig()

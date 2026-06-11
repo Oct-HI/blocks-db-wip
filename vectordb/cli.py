@@ -174,7 +174,8 @@ def main():
         )
         region = args.region or os.getenv("AWS_DEFAULT_REGION") or boto3.Session().region_name or "us-east-1"
         CONFIG_DIR.mkdir(exist_ok=True)
-        config_data = {"bucket": args.bucket, "region": region}
+        function_name = args.function_name or "blocksdb-autoindexer-default"
+        config_data = {"bucket": args.bucket, "region": region, "lambda_function_name": function_name}
         if use_s3express:
             config_data["s3express"] = True
             az = parse_express_az(args.bucket)

@@ -431,8 +431,12 @@ def create_sqs_queue(queue_name, region=None):
     return queue_url, queue_arn
 
 
-def configure_sqs_lambda_trigger(lambda_arn, queue_arn, batch_size=10, batch_window=5, region=None):
-    """Create event source mapping from SQS to Lambda."""
+def configure_sqs_lambda_trigger(lambda_arn, queue_arn, batch_size=10, batch_window=0, region=None):
+    """Create or update event source mapping from SQS to Lambda.
+
+    Re-enables any existing mapping (even if Disabled) instead of
+    failing with ResourceConflictException.
+    """
     lambda_client = boto3.client("lambda", region_name=region) if region else boto3.client("lambda")
 
     existing = lambda_client.list_event_source_mappings(
@@ -440,9 +444,20 @@ def configure_sqs_lambda_trigger(lambda_arn, queue_arn, batch_size=10, batch_win
         EventSourceArn=queue_arn,
     )
     for mapping in existing.get("EventSourceMappings", []):
+        uuid = mapping["UUID"]
         if mapping["State"] == "Enabled":
-            print(f"  SQS→Lambda mapping already exists (UUID: {mapping['UUID']})")
-            return mapping["UUID"]
+            print(f"  SQS→Lambda mapping already exists (UUID: {uuid})")
+            return uuid
+        # Re-enable Disabled mappings instead of creating duplicates
+        print(f"  SQS→Lambda mapping found but Disabled (UUID: {uuid}) — re-enabling...")
+        lambda_client.update_event_source_mapping(
+            UUID=uuid,
+            Enabled=True,
+            BatchSize=batch_size,
+            MaximumBatchingWindowInSeconds=batch_window,
+        )
+        print(f"  ✓ SQS→Lambda mapping re-enabled (UUID: {uuid}, batch={batch_size}, window={batch_window}s)")
+        return uuid
 
     response = lambda_client.create_event_source_mapping(
         EventSourceArn=queue_arn,
@@ -644,7 +659,7 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
                     configure_sqs_lambda_trigger(
                         lambda_arn, sqs_queue_arn,
                         batch_size=config.get("sqs_batch_size", 10),
-                        batch_window=config.get("sqs_batch_window", 5),
+                        batch_window=config.get("sqs_batch_window", 0),
                         region=region,
                     )
                     print("  ✓ SQS → Lambda trigger configured")
@@ -1183,8 +1198,19 @@ def update_lambda_threshold(threshold_bytes: int = None, dataset_name: str = Non
     """
     lambda_client = boto3.client("lambda")
     config = get_infra_config()
-    
-    function_name = config.get("lambda_function_name")
+
+    # Use the actual Lambda function name from backend config (if set),
+    # falling back to the hard-coded default
+    backend_config_path = Path.home() / ".blocks-db-config" / "backend_config.json"
+    if backend_config_path.exists():
+        try:
+            with open(backend_config_path) as f:
+                backend_config = json.load(f)
+            function_name = backend_config.get("lambda_function_name") or config.get("lambda_function_name")
+        except Exception:
+            function_name = config.get("lambda_function_name")
+    else:
+        function_name = config.get("lambda_function_name")
     
     if dataset_name and s3_bucket and threshold_bytes is None:
         config_key = f"indexes/{dataset_name}/blocks/config.json"
