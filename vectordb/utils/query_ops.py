@@ -48,7 +48,7 @@ def get_vectors_by_id(bucket, dataset_name, ids):
 
 
 def _load_csv_blocks(bucket, dataset_name):
-    key = f"csv_blocks_{dataset_name}.json"
+    key = f"tracking/csv_blocks_{dataset_name}.json"
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
@@ -70,7 +70,7 @@ def _find_block_for_id(blocks, vid):
 
 
 def _get_vector_by_range(bucket, dataset_name, block, vid):
-    key = f"vectors_{dataset_name}.csv"
+    key = f"datasets/{dataset_name}/source.csv"
     range_header = f"bytes={block['offset']}-{block['offset'] + block['size'] - 1}"
     obj = s3.get_object(Bucket=bucket, Key=key, Range=range_header)
     for raw_line in obj["Body"].iter_lines():
@@ -84,7 +84,7 @@ def _get_vector_by_range(bucket, dataset_name, block, vid):
 
 
 def _get_from_full_csv(bucket, dataset_name, ids):
-    key = f"vectors_{dataset_name}.csv"
+    key = f"datasets/{dataset_name}/source.csv"
     ids_set = set(ids)
     max_id = max(ids_set)
     results = {}
@@ -150,7 +150,7 @@ def _get_from_pending(bucket, dataset_name, ids):
 
 
 def list_vectors(bucket, dataset_name, limit=100):
-    key = f"vectors_{dataset_name}.csv"
+    key = f"datasets/{dataset_name}/source.csv"
     obj = s3.get_object(Bucket=bucket, Key=key)
     results = {}
 
@@ -167,7 +167,7 @@ def list_vectors(bucket, dataset_name, limit=100):
 
 
 def list_vectors_paginated(bucket, dataset_name, start=0, limit=100):
-    key = f"vectors_{dataset_name}.csv"
+    key = f"datasets/{dataset_name}/source.csv"
     obj = s3.get_object(Bucket=bucket, Key=key)
     results = {}
     current_index = 0

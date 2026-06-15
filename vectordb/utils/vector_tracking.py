@@ -55,8 +55,8 @@ class VectorIndexTracker:
         """Initialize the next available ID counter in DynamoDB for a dataset."""
         try:
             self.table.put_item(Item={
-                "centroid_id": "ID_TRACKER",
-                "sk": dataset_name,
+                "centroid_id": f"{dataset_name}_ID_TRACKER",
+                "sk": "META",
                 "next_id": next_id,
                 "dataset": dataset_name
             })
@@ -68,7 +68,7 @@ class VectorIndexTracker:
         """Atomically get and reserve the next `count` IDs. Returns the starting ID."""
         try:
             response = self.table.update_item(
-                Key={"centroid_id": "ID_TRACKER", "sk": dataset_name},
+                Key={"centroid_id": f"{dataset_name}_ID_TRACKER", "sk": "META"},
                 UpdateExpression="SET next_id = if_not_exists(next_id, :zero) + :inc",
                 ExpressionAttributeValues={":inc": count, ":zero": 0},
                 ReturnValues="ALL_NEW"
@@ -83,15 +83,15 @@ class VectorIndexTracker:
         """Get the next available ID from DynamoDB counter."""
         try:
             response = self.table.get_item(
-                Key={"centroid_id": "ID_TRACKER", "sk": dataset_name}
+                Key={"centroid_id": f"{dataset_name}_ID_TRACKER", "sk": "META"}
             )
             item = response.get("Item", {})
-            return item.get("next_id", 0)
+            return int(item.get("next_id", 0))
         except Exception as e:
             print(f"Error reading next_id from DynamoDB: {e}")
             return 0
 
-    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], create_file: bool = True) -> str:
+    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], create_file: bool = True, tags: dict = None) -> str:
         if not vectors:
             return None
         file_id = str(int(time.time() * 1000))

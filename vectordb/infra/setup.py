@@ -713,11 +713,22 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     show_progress(len(steps) - 1)
     
     print(f"\n✓ Setup complete!")
-    print(f"\nNext steps:")
-    print(f"  1. blocks-db configure --bucket {s3_bucket} --region {region}")
-    print(f"  2. blocks-db initialize-database mydata vectors.csv --config config.json")
-    print(f"  3. blocks-db put mydata new_vectors.csv  (add more vectors)")
-    print(f"  4. blocks-db query mydata --file queries.csv  (search)")
+    next_steps = [
+        f"  1. blocks-db configure --bucket {s3_bucket} --region {region}",
+        f"  2. blocks-db initialize-database mydata vectors.csv --config config.json",
+    ]
+    if use_sqs or not use_s3express:
+        next_steps += [
+            f"  3. blocks-db put mydata new_vectors.csv  (add more vectors)",
+        ]
+    next_steps += [
+        f"  {len(next_steps)+1}. blocks-db query mydata --file queries.csv  (search)",
+    ]
+    for s in next_steps:
+        print(s)
+
+    if use_sqs and sqs_queue_url:
+        print(f"\n  SQS Queue: {sqs_queue_url}")
 
 
 def create_lambda_manually(s3_bucket, layer_arn=None, function_name=None):
@@ -1088,6 +1099,19 @@ def deploy_lambda_code(function_name=None):
         return None
 
 
+
+
+def remove_s3_notification(s3_bucket):
+    """Remove any S3 bucket notification configuration to avoid duplicate triggers."""
+    s3_client = boto3.client("s3")
+    try:
+        s3_client.put_bucket_notification_configuration(
+            Bucket=s3_bucket,
+            NotificationConfiguration={}
+        )
+        print(f"  Removed S3 notification configuration from bucket: {s3_bucket}")
+    except Exception as e:
+        print(f"  Warning: Could not remove S3 notification: {e}")
 
 
 def configure_s3_notification(s3_bucket, lambda_arn, function_name=None):

@@ -278,12 +278,11 @@ def ensure_global_metadata(table, bucket=None, dataset=None):
         print(f"Warning initializing {pk}: {e}")
 
 
-def move_indexed_files_to_processed(bucket: str, table, centroid_id: int):
-    """Delete processed files from pending/ (the processed batch is written separately with corrected IDs)."""
-    files = get_files_for_centroid(centroid_id, table)
+def move_indexed_files_to_processed(bucket: str, table, dataset: str, centroid_id: int):
+    files = get_files_for_centroid(dataset, centroid_id, table)
     if not files:
         return
-    
+
     for f in files:
         try:
             source_key = f"{f['prefix']}/{f['file_key']}"
@@ -291,10 +290,20 @@ def move_indexed_files_to_processed(bucket: str, table, centroid_id: int):
             print(f"Deleted processed pending file: {source_key}")
         except Exception as e:
             print(f"Error deleting file {f.get('file_key')}: {e}")
+        try:
+            table.delete_item(Key={"centroid_id": "PENDING", "sk": f"FILE#{source_key}"})
+            print(f"Cleaned up PENDING tracking for {source_key}")
+        except Exception as e:
+            print(f"Error cleaning up PENDING tracking for {source_key}: {e}")
+        try:
+            centroid_key = f"{dataset}#{centroid_id}"
+            table.delete_item(Key={"centroid_id": centroid_key, "sk": f"FILE#{source_key}"})
+            print(f"Cleaned up centroid tracking for {source_key}")
+        except Exception as e:
+            print(f"Error cleaning up centroid tracking for {source_key}: {e}")
 
 
 def save_processed_batch(bucket: str, dataset: str, centroid_id: int, new_ids: List[int], vectors: List[List[float]]) -> None:
-    """Write a batch CSV with corrected IDs to processed/."""
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(["id", "vector"])
@@ -350,8 +359,7 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
 
     if not vectors or features is None:
         return
-    
-    # Use atomic DynamoDB counter to get and reserve IDs
+
     next_available_id = get_next_available_id_atomic(bucket, dataset, len(original_ids))
     new_ids = list(range(next_available_id, next_available_id + len(original_ids)))
     print(f"Reassigning IDs: {len(original_ids)} vectors from IDs {min(original_ids)}-{max(original_ids)} to {next_available_id}-{next_available_id + len(new_ids) - 1}")
@@ -381,8 +389,45 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
     update_indexed_tracking(bucket, dataset, new_ids)
 
     save_processed_batch(bucket, dataset, centroid_id, new_ids, vectors)
-    
+
     update_config_num_index(bucket, dataset, centroid_id + 1)
+
+    save_centroid_tags(centroid_id, dataset, files, table)
+
+
+def save_centroid_tags(centroid_id: int, dataset: str, files: List[Dict], table):
+    aggregated = {}
+    for f in files:
+        raw_tags = f.get("tags")
+        if not raw_tags:
+            continue
+        if isinstance(raw_tags, str):
+            try:
+                tags = json.loads(raw_tags)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        else:
+            tags = raw_tags
+        if not isinstance(tags, dict):
+            continue
+        for k, v in tags.items():
+            if k not in aggregated:
+                aggregated[k] = set()
+            aggregated[k].add(v)
+
+    if not aggregated:
+        return
+
+    tags_map = {k: list(v) for k, v in aggregated.items()}
+    try:
+        table.put_item(Item={
+            "centroid_id": f"DATASET#{dataset}",
+            "sk": f"CENTROID#{centroid_id}#META",
+            "tags": tags_map
+        })
+        print(f"Saved tags for centroids/{dataset}/{centroid_id}: {tags_map}")
+    except Exception as e:
+        print(f"Error saving centroid tags: {e}")
 
 
 def update_config_num_index(bucket: str, dataset: str, num_index: int):
@@ -409,24 +454,20 @@ def update_config_num_index(bucket: str, dataset: str, num_index: int):
 
 
 def get_next_available_id_atomic(bucket: str, dataset: str, count: int) -> int:
-    """Atomically get and reserve the next `count` IDs from DynamoDB. Returns the starting ID."""
     global dynamodb
     if isinstance(dynamodb, boto3.resources.factory.ServiceResource):
         table = dynamodb.Table(DYNAMODB_TABLE)
     else:
-        # Re-initialize if needed
         dynamodb = boto3.resource("dynamodb")
         table = dynamodb.Table(DYNAMODB_TABLE)
-    
+
     try:
         response = table.update_item(
-            Key={"centroid_id": "ID_TRACKER", "sk": dataset},
+            Key={"centroid_id": f"{dataset}_ID_TRACKER", "sk": "META"},
             UpdateExpression="SET next_id = if_not_exists(next_id, :zero) + :inc",
             ExpressionAttributeValues={":inc": count, ":zero": 0},
             ReturnValues="ALL_NEW"
         )
-        # Return the starting ID (value after increment minus count)
-        # Convert Decimal to int since DynamoDB returns Decimal type
         return int(response["Attributes"]["next_id"] - count)
     except Exception as e:
         print(f"Error getting next ID atomically: {e}")
@@ -434,8 +475,7 @@ def get_next_available_id_atomic(bucket: str, dataset: str, count: int) -> int:
 
 
 def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
-    """Track indexed vector IDs in S3 for status commands (optional with atomic DynamoDB counter)."""
-    key = f"indexed_ids_{dataset}.json"
+    key = f"tracking/indexed_ids_{dataset}.json"
     try:
         existing = s3.get_object(Bucket=bucket, Key=key)
         import orjson
@@ -443,7 +483,6 @@ def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
     except:
         indexed_set = set()
 
-    # IDs are already reassigned by create_index_for_centroid()
     indexed_set.update(ids)
 
     import orjson
@@ -455,6 +494,7 @@ def update_indexed_tracking(bucket: str, dataset: str, ids: List[int]):
     )
 
     return ids
+
 
 def get_files_for_centroid(dataset: str, centroid_id: int, table) -> List[Dict]:
     files = []

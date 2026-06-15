@@ -385,10 +385,26 @@ class VectorDBClient:
         self.tracker.mark_vectors_indexed(dataset_name, pending_ids)
         print(f"Marked {len(pending_ids)} pending vectors as indexed for hybrid search.")
 
-    def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int):
-        """Read the main CSV and track all vectors as indexed + build csv_blocks for optimized get."""
-        key = f"vectors_{dataset_name}.csv"
-        indexed_ids = []
+    def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int, use_s3express: bool = False, prebuilt_blocks: tuple = None):
+        """Read the main CSV and track all vectors as indexed + build csv_blocks for optimized get.
+
+        If prebuilt_blocks=(blocks, last_vid) is provided, skip S3 download
+        and use the pre-built blocks instead.
+        """
+        if prebuilt_blocks is not None:
+            blocks, last_vid = prebuilt_blocks
+            if blocks:
+                blocks_key = f"tracking/csv_blocks_{dataset_name}.json"
+                self.s3.put_object(Bucket=self.bucket, Key=blocks_key, Body=json.dumps(blocks))
+                print(f"Stored {len(blocks)} pre-built CSV blocks for optimized get.")
+            if last_vid is not None:
+                next_id = last_vid + 1
+                self.tracker.initialize_next_id(dataset_name, next_id)
+                print(f"Tracked {next_id} vectors as indexed (from local file).")
+                print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
+            return
+
+        key = f"datasets/{dataset_name}/source.csv"
         block_size = 500000  # ~500KB per block
         blocks = []
 
@@ -411,7 +427,6 @@ class VectorDBClient:
                 line = raw_line.decode()
                 id_str = line.split(",")[0]
                 vec_id = int(id_str)
-                indexed_ids.append(vec_id)
 
                 if current_block_start_id is None:
                     current_block_start_id = vec_id
@@ -440,16 +455,14 @@ class VectorDBClient:
                 })
 
             if blocks:
-                blocks_key = f"csv_blocks_{dataset_name}.json"
+                blocks_key = f"tracking/csv_blocks_{dataset_name}.json"
                 self.s3.put_object(Bucket=self.bucket, Key=blocks_key, Body=json.dumps(blocks))
                 print(f"Built {len(blocks)} CSV blocks for optimized get.")
 
-            if indexed_ids:
-                self.tracker.create_indexed_tracking(dataset_name, indexed_ids)
-                # Initialize DynamoDB counter for atomic ID tracking
-                next_id = max(indexed_ids) + 1
+            if last_vid is not None:
+                next_id = last_vid + 1
                 self.tracker.initialize_next_id(dataset_name, next_id)
-                print(f"Tracked {len(indexed_ids)} vectors as indexed.")
+                print(f"Tracked {next_id} vectors as indexed.")
                 print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
         except Exception as e:
             print(f"Warning: Could not track indexed vectors: {e}")
