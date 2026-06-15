@@ -1,3 +1,4 @@
+import uuid
 from lithops import FunctionExecutor, Storage
 import time
 import importlib
@@ -71,21 +72,22 @@ class Orchestrator:
             times.append(res[1])
         return results, times
 
-    def search(self, id_query, queries, n=None, k_search=None, k_result=None):
+    def search(self, id_query, queries, n=None, k_search=None, k_result=None, filter_tags=None):
         n        = n        if n        is not None else len(queries)
         k_search = k_search if k_search is not None else self.config.k_search
         k_result = k_result if k_result is not None else self.config.k_result
 
         start = init = time.time()
 
-        queries_key = f"queries_{self.config.dataset}_{self.config.num_index}.csv"
+        queries_suffix = uuid.uuid4().hex
+        queries_key = f"queries/testdata/{queries_suffix}_queries_{self.config.dataset}_{self.config.num_index}.csv"
         self.function_executor.storage.put_object(
             bucket=self.config.storage_bucket,
             key=queries_key,
             body=orjson.dumps(queries.tolist())
         )
 
-        index_to_compute = self.query_strategy.create_map_tasks(queries_key, self.config)
+        index_to_compute = self.query_strategy.create_map_tasks(queries_key, self.config, storage=self.function_executor.storage, filter_tags=filter_tags)
 
         create_map_data = time.time()
 
@@ -105,6 +107,8 @@ class Orchestrator:
         ]
         map_execution = time.time()
         map_res, map_times = self.divide_map_results(map_futures_res)
+
+        self.pool.submit(self.function_executor.storage.delete_object, self.config.storage_bucket, queries_key)
 
         # --- Reduce ---
         reduce_iterdata, reduce_iterdata_times = self.create_reduce_iterdata(map_res, k_result, 1000)

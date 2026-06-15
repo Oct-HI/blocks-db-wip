@@ -2,11 +2,15 @@ import argparse
 import csv
 import json
 import os
+import time
 from pathlib import Path
 
-from .client import VectorDBClient
+import boto3
+
+from .client import VectorDBClient, build_csv_blocks_from_local
 from .infra import run_setup, refresh_lithops_credentials, get_infra_config
 from .config import DEFAULT_INFRA_CONFIG
+from .utils.s3_utils import is_s3express_bucket, parse_express_az
 
 
 CONFIG_DIR = Path.home() / ".blocks-db-config"
@@ -43,6 +47,8 @@ def main():
     setup_parser.add_argument("--threshold", type=int, default=None, help="Auto-indexer threshold in bytes (default: 5242880)")
     setup_parser.add_argument("--skip-vector-table", action="store_true", help="Skip DynamoDB table creation")
     setup_parser.add_argument("--skip-runtime", action="store_true", help="Skip Lithops runtime build")
+    setup_parser.add_argument("--s3express", action="store_true", help="Use S3 Express One Zone (auto-enables SQS)")
+    setup_parser.add_argument("--sqs", action="store_true", help="Use SQS instead of S3 notifications for auto-indexer trigger")
 
     # ── update-threshold ─────────────────────────────────────
     threshold_parser = subparsers.add_parser("update-threshold", help="Update auto-indexer block size threshold")
@@ -59,6 +65,7 @@ def main():
     configure_parser = subparsers.add_parser("configure", help="Save default bucket and region")
     configure_parser.add_argument("--bucket", required=True, help="Default S3 bucket")
     configure_parser.add_argument("--region", default="us-east-1", help="AWS region")
+    configure_parser.add_argument("--sqs", action="store_true", help="Use SQS for auto-indexer notifications")
 
     # ── initialize-database ───────────────────────────────────
     init_parser = subparsers.add_parser("initialize-database", help="Upload initial dataset and create index")
@@ -67,12 +74,15 @@ def main():
     init_parser.add_argument("--config", required=True, help="Path to index config JSON")
     init_parser.add_argument("--workers", type=int, default=16, help="Number of indexing workers")
     init_parser.add_argument("--no-update-threshold", action="store_true", help="Skip auto-update threshold after indexing")
+    init_parser.add_argument("--skip-auto-indexer", action="store_true", help="Skip DynamoDB state init and vector tracking (for pure benchmarks)")
+    init_parser.add_argument("--build-local", action="store_true", help="Build csv_blocks from local file (skip S3 re-download during tracking)")
 
     # ── put ───────────────────────────────────────────────────
     put_parser = subparsers.add_parser("put", help="Add new vectors (stored as individual files)")
     put_parser.add_argument("name", help="Dataset name")
     put_parser.add_argument("csv_path", help="CSV file with vectors (id, vector values)")
     put_parser.add_argument("--single", action="store_true", help="Treat as single vector per file (one vector per file)")
+    put_parser.add_argument("--tags", type=str, default=None, help='JSON dict of tags (e.g. \'{"source":"web","category":"news"}\')')
 
     # ── query ─────────────────────────────────────────────────
     query_parser = subparsers.add_parser("query", help="Query vectors (searches indexed + pending)")
@@ -82,6 +92,8 @@ def main():
     query_group.add_argument("--file", help="CSV file with query vectors")
     query_parser.add_argument("--k", type=int, default=10, help="Number of results")
     query_parser.add_argument("--indexed-only", action="store_true", help="Search only indexed vectors (skip pending)")
+    query_parser.add_argument("--batch-size", type=int, default=None, help="Override query_batch_size (centroid .ann per map worker)")
+    query_parser.add_argument("--filter", type=str, default=None, help='JSON dict of tag filters (e.g. \'{"source":"web"}\'), AND semantics, only centroids/pending matching ALL tags are searched')
 
     # ── status ────────────────────────────────────────────────
     status_parser = subparsers.add_parser("status", help="Show dataset status")
@@ -123,9 +135,15 @@ def main():
             "Bucket not provided. Use --bucket, set SVDB_BUCKET, or run 'blocks-db configure'."
         )
 
+    sqs_queue_url = file_config.get("sqs_queue_url")
     client = None
     if args.command not in commands_without_bucket:
-        client = VectorDBClient(bucket=bucket, region=region)
+        client = VectorDBClient(bucket=bucket, region=region, sqs_queue_url=sqs_queue_url)
+
+    def _fmt_result(r):
+        if len(r) == 3:
+            return f"(id={r[0]}, dist={r[1]:.4f}, src={r[2]})"
+        return str(r)
 
     # ── setup ────────────────────────────────────────────────
     if args.command == "setup":
@@ -142,12 +160,39 @@ def main():
             overrides["lambda_role_name"] = args.role_name
         if args.threshold:
             overrides["threshold_size_mb"] = args.threshold
+        use_s3express = args.s3express or is_s3express_bucket(args.bucket)
+        use_sqs = args.sqs or use_s3express
+        if use_s3express:
+            overrides["use_s3express"] = True
+        if use_sqs:
+            overrides["sqs_use_sqs"] = True
         run_setup(
             s3_bucket=args.bucket,
             config_overrides=overrides,
             create_vector_table=not args.skip_vector_table,
             build_runtime=not args.skip_runtime,
         )
+        region = args.region or os.getenv("AWS_DEFAULT_REGION") or boto3.Session().region_name or "us-east-1"
+        CONFIG_DIR.mkdir(exist_ok=True)
+        function_name = args.function_name or "blocksdb-autoindexer-default"
+        config_data = {"bucket": args.bucket, "region": region, "lambda_function_name": function_name}
+        if use_s3express:
+            config_data["s3express"] = True
+            az = parse_express_az(args.bucket)
+            if az:
+                config_data["express_az"] = az
+        if use_sqs:
+            config_data["use_sqs"] = True
+            sqs_queue_name = overrides.get("sqs_queue_name", f"blocksdb-pending-{args.bucket.replace('.', '-')}")
+            try:
+                sqs = boto3.client("sqs", region_name=region)
+                sqs_queue_url = sqs.get_queue_url(QueueName=sqs_queue_name)["QueueUrl"]
+                config_data["sqs_queue_url"] = sqs_queue_url
+            except Exception:
+                pass
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config_data, f, indent=4)
+        print(f"Configuration saved to {CONFIG_FILE}")
 
     elif args.command == "update-threshold":
         from .infra import update_lambda_threshold
@@ -166,16 +211,43 @@ def main():
 
     elif args.command == "configure":
         CONFIG_DIR.mkdir(exist_ok=True)
+        use_s3express = is_s3express_bucket(args.bucket)
+        use_sqs = args.sqs or use_s3express
+        config_data = {"bucket": args.bucket, "region": args.region}
+        if use_s3express:
+            config_data["s3express"] = True
+            az = parse_express_az(args.bucket)
+            if az:
+                config_data["express_az"] = az
+        if use_sqs:
+            config_data["use_sqs"] = True
+            sqs_queue_name = f"blocksdb-pending-{args.bucket.replace('.', '-')}"
+            try:
+                sqs = boto3.client("sqs", region_name=args.region)
+                sqs_queue_url = sqs.get_queue_url(QueueName=sqs_queue_name)["QueueUrl"]
+                config_data["sqs_queue_url"] = sqs_queue_url
+            except Exception:
+                pass
         with open(CONFIG_FILE, "w") as f:
-            json.dump({"bucket": args.bucket, "region": args.region}, f, indent=4)
+            json.dump(config_data, f, indent=4)
         print(f"Configuration saved to {CONFIG_FILE}")
 
     # ── initialize-database ───────────────────────────────────
     elif args.command == "initialize-database":
         print(f"\n=== Uploading dataset '{args.name}' ===")
 
+        csv_blocks = None
+        if args.build_local:
+            t0 = time.time()
+            csv_blocks = build_csv_blocks_from_local(args.csv_path)
+            local_build_time = time.time() - t0
+            blocks, last_vid = csv_blocks
+            print(f"Built {len(blocks)} csv_blocks from local file (last_vid={last_vid}) in {local_build_time:.3f}s.")
+
+        t0 = time.time()
         client.create_dataset(args.name, args.csv_path)
-        print(f"Dataset uploaded.")
+        upload_time = time.time() - t0
+        print(f"Dataset uploaded in {upload_time:.3f}s.")
 
         with open(args.config) as f:
             config = json.load(f)
@@ -184,11 +256,15 @@ def main():
         times = client.index_dataset(
             dataset_name=args.name,
             config=config,
-            num_workers=args.workers
+            num_workers=args.workers,
+            setup_auto_indexer=not args.skip_auto_indexer,
+            csv_blocks=csv_blocks
         )
+        times["upload_dataset"] = upload_time
         print(f"Index built successfully.")
         print(f"Timing: {json.dumps(times, indent=2)}")
 
+        use_s3express = is_s3express_bucket(bucket) if bucket else False
         if not args.no_update_threshold:
             print(f"\n=== Updating auto-indexer threshold ===")
             from .infra import update_lambda_threshold
@@ -202,6 +278,10 @@ def main():
     elif args.command == "put":
         from .utils.vector_utils import load_vectors_with_ids_from_csv, load_vectors_from_csv
 
+        tags = json.loads(args.tags) if args.tags else None
+        if tags:
+            print(f"Tags: {tags}")
+
         print(f"\n=== Putting vectors into '{args.name}' ===")
 
         if args.single:
@@ -213,7 +293,7 @@ def main():
                     try:
                         vec_id = int(row[0])
                         vec = [float(x) for x in row[1].strip().split() if x]
-                        key = client.tracker.put_vector(args.name, vec_id, vec)
+                        key = client.tracker.put_vector(args.name, vec_id, vec, tags=tags)
                         print(f"  Uploaded vector {vec_id} -> {key}")
                     except (ValueError, IndexError) as e:
                         print(f"  Skipping invalid line: {row} ({e})")
@@ -226,10 +306,10 @@ def main():
 
             if len(vectors) == 1:
                 vec_id, vec = vectors[0]
-                key = client.tracker.put_vector(args.name, vec_id, vec)
+                key = client.tracker.put_vector(args.name, vec_id, vec, tags=tags)
                 print(f"Uploaded 1 vector -> {key}")
             else:
-                key = client.tracker.put_vectors(args.name, vectors)
+                key = client.tracker.put_vectors(args.name, vectors, tags=tags)
                 print(f"Uploaded {len(vectors)} vectors -> {key}")
 
         print(f"\nVectors added to pending. Use 'blocks-db query {args.name}' to search them.")
@@ -239,23 +319,30 @@ def main():
         print(f"\n=== Querying '{args.name}' ===")
 
         hybrid = not args.indexed_only
+        filter_tags = json.loads(args.filter) if args.filter else None
+        if filter_tags:
+            print(f"Filter tags: {filter_tags}")
 
         if args.vector:
             vector = [float(x) for x in args.vector.split()]
-            results, times = client.query(args.name, vector, k=args.k, hybrid=hybrid)
+            results, times = client.query(args.name, vector, k=args.k, hybrid=hybrid, batch_size=args.batch_size, filter_tags=filter_tags)
             print(f"Query: {vector[:5]}...")
-            print(f"Results: {results[:args.k]}")
+            print(f"Results: {[_fmt_result(r) for r in results[:args.k]]}")
         elif args.file:
             if not os.path.exists(args.file):
                 raise FileNotFoundError(args.file)
-            results, times = client.query_from_file(args.name, args.file, hybrid=hybrid, k=args.k)
+            results, times = client.query_from_file(args.name, args.file, hybrid=hybrid, k=args.k, batch_size=args.batch_size, filter_tags=filter_tags)
             print(f"Results ({len(results)} queries):")
             for i, res in enumerate(results[:5]):
-                print(f"  Query {i}: {res[:args.k]}")
+                print(f"  Query {i}: {[_fmt_result(r) for r in res[:args.k]]}")
             if len(results) > 5:
                 print(f"  ... and {len(results) - 5} more queries")
 
+        if args.batch_size:
+            print(f"Batch size: {args.batch_size} (override)")
         print(f"\nSearch mode: {'hybrid (indexed + pending)' if hybrid else 'indexed only'}")
+        if filter_tags:
+            print(f"Filter tags: {filter_tags}")
         if "error" not in times:
             print(f"Query times: {json.dumps(times, indent=2)}")
 

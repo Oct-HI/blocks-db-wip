@@ -7,6 +7,7 @@ import tempfile
 import os
 import csv
 import io
+import json
 import time
 
 from .s3_client import s3
@@ -15,8 +16,9 @@ from .s3_client import s3
 class VectorIndexTracker:
     DYNAMODB_TABLE_NAME = "BlocksDB-default"
 
-    def __init__(self, bucket: str, region: str = None):
+    def __init__(self, bucket: str, region: str = None, sqs_queue_url: str = None):
         self.bucket = bucket
+        self.sqs_queue_url = sqs_queue_url
         if region:
             self.dynamodb = boto3.resource("dynamodb", region_name=region)
             self.s3 = boto3.client("s3", region_name=region)
@@ -24,6 +26,8 @@ class VectorIndexTracker:
             self.dynamodb = boto3.resource("dynamodb")
             self.s3 = boto3.client("s3")
         self.table = self.dynamodb.Table(self.DYNAMODB_TABLE_NAME)
+        if sqs_queue_url:
+            self.sqs = boto3.client("sqs", region_name=region) if region else boto3.client("sqs")
 
     def get_indexed_files_key(self, dataset_name: str) -> str:
         return f"indexed_files_{dataset_name}.json"
@@ -45,14 +49,14 @@ class VectorIndexTracker:
         return f"pending/{dataset_name}/{file_id}.csv"
 
     def get_indexed_ids_key(self, dataset_name: str) -> str:
-        return f"indexed_ids_{dataset_name}.json"
+        return f"tracking/indexed_ids_{dataset_name}.json"
 
     def initialize_next_id(self, dataset_name: str, next_id: int):
         """Initialize the next available ID counter in DynamoDB for a dataset."""
         try:
             self.table.put_item(Item={
-                "centroid_id": "ID_TRACKER",
-                "sk": dataset_name,
+                "centroid_id": f"{dataset_name}_ID_TRACKER",
+                "sk": "META",
                 "next_id": next_id,
                 "dataset": dataset_name
             })
@@ -64,7 +68,7 @@ class VectorIndexTracker:
         """Atomically get and reserve the next `count` IDs. Returns the starting ID."""
         try:
             response = self.table.update_item(
-                Key={"centroid_id": "ID_TRACKER", "sk": dataset_name},
+                Key={"centroid_id": f"{dataset_name}_ID_TRACKER", "sk": "META"},
                 UpdateExpression="SET next_id = if_not_exists(next_id, :zero) + :inc",
                 ExpressionAttributeValues={":inc": count, ":zero": 0},
                 ReturnValues="ALL_NEW"
@@ -79,15 +83,15 @@ class VectorIndexTracker:
         """Get the next available ID from DynamoDB counter."""
         try:
             response = self.table.get_item(
-                Key={"centroid_id": "ID_TRACKER", "sk": dataset_name}
+                Key={"centroid_id": f"{dataset_name}_ID_TRACKER", "sk": "META"}
             )
             item = response.get("Item", {})
-            return item.get("next_id", 0)
+            return int(item.get("next_id", 0))
         except Exception as e:
             print(f"Error reading next_id from DynamoDB: {e}")
             return 0
 
-    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], create_file: bool = True) -> str:
+    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], create_file: bool = True, tags: dict = None) -> str:
         if not vectors:
             return None
         file_id = str(int(time.time() * 1000))
@@ -101,26 +105,46 @@ class VectorIndexTracker:
             writer.writerow([vec_id, vec_str])
         csv_bytes = csv_buffer.getvalue().encode("utf-8")
 
-        s3.put_object(Bucket=self.bucket, Key=key, Body=csv_bytes)
-        
+        extra_args = {}
+        if tags:
+            extra_args["Metadata"] = {"tags": json.dumps(tags)}
+        s3.put_object(Bucket=self.bucket, Key=key, Body=csv_bytes, **extra_args)
+
+        if self.sqs_queue_url:
+            try:
+                self.sqs.send_message(
+                    QueueUrl=self.sqs_queue_url,
+                    MessageBody=json.dumps({
+                        "bucket": self.bucket,
+                        "key": key,
+                        "file_size": len(csv_bytes),
+                        "tags": tags,
+                    })
+                )
+            except Exception as e:
+                print(f"SQS notification error (non-fatal): {e}")
+
         new_ids = [v[0] for v in vectors]
-        self._update_pending_tracking(dataset_name, new_ids, key)
-        
+        self._update_pending_tracking(dataset_name, new_ids, key, tags)
+
         return key
 
-    def put_vector(self, dataset_name: str, vector_id: int, vector: List[float]) -> str:
-        return self.put_vectors(dataset_name, [(vector_id, vector)])
+    def put_vector(self, dataset_name: str, vector_id: int, vector: List[float], tags: dict = None) -> str:
+        return self.put_vectors(dataset_name, [(vector_id, vector)], tags=tags)
 
-    def _update_pending_tracking(self, dataset_name: str, vector_ids: List[int], file_key: str):
+    def _update_pending_tracking(self, dataset_name: str, vector_ids: List[int], file_key: str, tags: dict = None):
         try:
-            self.table.put_item(Item={
+            item = {
                 "centroid_id": "PENDING",
                 "sk": f"FILE#{file_key}",
                 "dataset": dataset_name,
                 "file_key": file_key,
                 "vector_ids": vector_ids[:1000] if vector_ids else [],
                 "timestamp": int(time.time())
-            })
+            }
+            if tags:
+                item["tags"] = json.dumps(tags)
+            self.table.put_item(Item=item)
         except Exception as e:
             print(f"DynamoDB tracking error (non-fatal): {e}")
 

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import boto3
 from ..config import DEFAULT_INFRA_CONFIG, get_infra_config as _get_infra_config
+from ..utils.s3_utils import is_s3express_bucket, parse_express_az
 
 
 LITHOPS_CONFIG_DIR = Path.home() / ".lithops"
@@ -383,6 +384,141 @@ def ecr_login(region):
         print("Logged into ECR successfully.")
 
 
+def create_sqs_queue(queue_name, region=None):
+    """Create SQS queue with DLQ for auto-indexer notifications."""
+    sqs = boto3.client("sqs", region_name=region) if region else boto3.client("sqs")
+    dlq_name = f"{queue_name}-dlq"
+
+    dlq_url = None
+    try:
+        dlq = sqs.create_queue(
+            QueueName=dlq_name,
+            Attributes={
+                "MessageRetentionPeriod": "1209600",  # 14 days
+            }
+        )
+        dlq_url = dlq["QueueUrl"]
+        dlq_arn = sqs.get_queue_attributes(QueueUrl=dlq_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        print(f"  ✓ DLQ created: {dlq_name}")
+    except sqs.exceptions.QueueNameExists:
+        dlq_url = sqs.get_queue_url(QueueName=dlq_name)["QueueUrl"]
+        dlq_arn = sqs.get_queue_attributes(QueueUrl=dlq_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        print(f"  DLQ already exists: {dlq_name}")
+
+    redrive_policy = json.dumps({
+        "deadLetterTargetArn": dlq_arn,
+        "maxReceiveCount": 3
+    })
+
+    try:
+        queue = sqs.create_queue(
+            QueueName=queue_name,
+            Attributes={
+                "VisibilityTimeout": "900",
+                "MessageRetentionPeriod": "1209600",
+                "ReceiveMessageWaitTimeSeconds": "20",
+                "RedrivePolicy": redrive_policy,
+            }
+        )
+        queue_url = queue["QueueUrl"]
+        print(f"  ✓ SQS queue created: {queue_name}")
+    except sqs.exceptions.QueueNameExists:
+        queue_url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+        sqs.set_queue_attributes(QueueUrl=queue_url, Attributes={"RedrivePolicy": redrive_policy})
+        print(f"  SQS queue already exists: {queue_name}")
+
+    queue_arn = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    return queue_url, queue_arn
+
+
+def configure_sqs_lambda_trigger(lambda_arn, queue_arn, batch_size=10, batch_window=0, region=None):
+    """Create or update event source mapping from SQS to Lambda.
+
+    Re-enables any existing mapping (even if Disabled) instead of
+    failing with ResourceConflictException.
+    """
+    lambda_client = boto3.client("lambda", region_name=region) if region else boto3.client("lambda")
+
+    existing = lambda_client.list_event_source_mappings(
+        FunctionName=lambda_arn,
+        EventSourceArn=queue_arn,
+    )
+    for mapping in existing.get("EventSourceMappings", []):
+        uuid = mapping["UUID"]
+        if mapping["State"] == "Enabled":
+            print(f"  SQS→Lambda mapping already exists (UUID: {uuid})")
+            return uuid
+        # Re-enable Disabled mappings instead of creating duplicates
+        print(f"  SQS→Lambda mapping found but Disabled (UUID: {uuid}) — re-enabling...")
+        lambda_client.update_event_source_mapping(
+            UUID=uuid,
+            Enabled=True,
+            BatchSize=batch_size,
+            MaximumBatchingWindowInSeconds=batch_window,
+        )
+        print(f"  ✓ SQS→Lambda mapping re-enabled (UUID: {uuid}, batch={batch_size}, window={batch_window}s)")
+        return uuid
+
+    response = lambda_client.create_event_source_mapping(
+        EventSourceArn=queue_arn,
+        FunctionName=lambda_arn,
+        Enabled=True,
+        BatchSize=batch_size,
+        MaximumBatchingWindowInSeconds=batch_window,
+    )
+    uuid = response["UUID"]
+    print(f"  ✓ SQS→Lambda event source mapping created (UUID: {uuid}, batch={batch_size}, window={batch_window}s)")
+    return uuid
+
+
+def add_sqs_policy_to_role(role_name, queue_arn, region=None):
+    """Attach inline policy granting SQS permissions to the Lambda role."""
+    iam = boto3.client("iam")
+    policy_name = "blocksdb-sqs-policy"
+    policy_doc = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes",
+            ],
+            "Resource": queue_arn
+        }]
+    }
+    try:
+        iam.put_role_policy(
+            RoleName=role_name,
+            PolicyName=policy_name,
+            PolicyDocument=json.dumps(policy_doc),
+        )
+        print(f"  ✓ SQS policy attached to role '{role_name}'")
+    except Exception as e:
+        print(f"  Warning attaching SQS policy: {e}")
+
+
+def add_s3express_bucket_policy(role_name, bucket_name, region=None):
+    """Attach inline policy granting s3express:CreateSession to the Lambda role."""
+    iam = boto3.client("iam")
+    sts = boto3.client("sts")
+    account_id = sts.get_caller_identity()["Account"]
+    bucket_arn = f"arn:aws:s3express:{region or 'us-east-1'}:{account_id}:bucket/{bucket_name}"
+    policy_doc = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "s3express:CreateSession",
+            "Resource": bucket_arn
+        }]
+    }
+    iam.put_role_policy(
+        RoleName=role_name,
+        PolicyName="blocksdb-s3express-policy",
+        PolicyDocument=json.dumps(policy_doc),
+    )
+
+
 def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_runtime=True):
     """
     Setup Blocks-DB infrastructure.
@@ -398,16 +534,34 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     lambda_function_name = config.get("lambda_function_name")
     runtime_name = config.get("runtime_name")
     threshold_bytes = config.get("threshold_size_bytes")
-    
+    use_s3express = is_s3express_bucket(s3_bucket) or config.get("use_s3express", False)
+    use_sqs = config.get("sqs_use_sqs", False) or use_s3express
+
     # template_path not used - setup creates resources manually
-    
+
     region = boto3.Session().region_name or "us-east-1"
-    
+
+    if "sqs_queue_name" not in (config_overrides or {}):
+        config["sqs_queue_name"] = f"blocksdb-pending-{s3_bucket.replace('.', '-')}"
+    sqs_queue_name = config["sqs_queue_name"]
+
     steps = [
         ("Setting up infrastructure", False),
-        ("Building Lambda layer with dependencies", False),
-        ("Creating Lambda with code + layer", False),
-        ("Configuring S3 trigger", False),
+    ]
+    if use_sqs:
+        steps += [
+            ("Building Lambda layer with dependencies", False),
+            ("Creating Lambda with code + layer", False),
+            ("Creating SQS queue and DLQ", False),
+            ("Configuring SQS → Lambda trigger", False),
+        ]
+    elif not use_s3express:
+        steps += [
+            ("Building Lambda layer with dependencies", False),
+            ("Creating Lambda with code + layer", False),
+            ("Configuring S3 trigger", False),
+        ]
+    steps += [
         ("Creating DynamoDB table", False),
         ("Logging into ECR", False),
         ("Generating Lithops config", False),
@@ -429,49 +583,105 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
     lambda_arn = None
     execution_role = None
     layer_arn = None
-    
-    steps[0] = (steps[0][0], True)
-    show_progress(1)
-    
-    print("  Building Lambda layer with dependencies...")
-    try:
-        layer_arn = create_faiss_lambda_layer()
-        if layer_arn:
-            print(f"  ✓ Lambda layer created: {layer_arn}")
+    sqs_queue_url = None
+
+    if use_sqs:
+        az = parse_express_az(s3_bucket) if use_s3express else None
+        if az:
+            print(f"  S3 Express One Zone detected (AZ: {az}) — using SQS for auto-indexer")
         else:
-            print("  ⚠ Could not create Lambda layer")
-    except Exception as e:
-        print(f"  Warning building layer: {e}")
-    
-    steps[1] = (steps[1][0], True)
-    show_progress(2)
-    
-    print("  Creating Lambda with code + layer...")
-    try:
-        lambda_arn = create_lambda_with_code_and_layer(s3_bucket, layer_arn, lambda_function_name)
-        if lambda_arn:
-            print(f"  ✓ Lambda created: {lambda_arn}")
-    except Exception as e:
-        print(f"  Warning creating Lambda: {e}")
-    
-    steps[2] = (steps[2][0], True)
-    show_progress(3)
-    
-    if lambda_arn:
-        print("  Configuring S3 bucket notification...")
+            print(f"  SQS-based auto-indexer enabled")
+
+    steps[0] = (steps[0][0], True)
+    step_idx = 1
+
+    if use_sqs or not use_s3express:
+        show_progress(step_idx)
+        print("  Building Lambda layer with dependencies...")
         try:
-            configure_s3_notification(s3_bucket, lambda_arn, lambda_function_name)
-            print("  ✓ S3 trigger configured")
+            layer_arn = create_faiss_lambda_layer()
+            if layer_arn:
+                print(f"  ✓ Lambda layer created: {layer_arn}")
+            else:
+                print("  ⚠ Could not create Lambda layer")
         except Exception as e:
-            print(f"  Warning: {e}")
-        steps[3] = (steps[3][0], True)
-    show_progress(4)
+            print(f"  Warning building layer: {e}")
+        steps[step_idx] = (steps[step_idx][0], True)
+        step_idx += 1
+
+        show_progress(step_idx)
+        print("  Creating Lambda with code + layer...")
+        try:
+            lambda_arn = create_lambda_with_code_and_layer(s3_bucket, layer_arn, lambda_function_name)
+            if lambda_arn:
+                print(f"  ✓ Lambda created: {lambda_arn}")
+        except Exception as e:
+            print(f"  Warning creating Lambda: {e}")
+        steps[step_idx] = (steps[step_idx][0], True)
+        step_idx += 1
+
+        show_progress(step_idx)
+        if lambda_arn:
+            if use_sqs:
+                print("  Creating SQS queue and DLQ...")
+                try:
+                    sqs_queue_url, sqs_queue_arn = create_sqs_queue(sqs_queue_name, region)
+                    print(f"  ✓ SQS queue: {sqs_queue_url}")
+                except Exception as e:
+                    print(f"  Warning: {e}")
+                steps[step_idx] = (steps[step_idx][0], True)
+                step_idx += 1
+
+                print("  Attaching SQS permissions to Lambda role...")
+                lambda_role_name = config.get("lambda_role_name", f"{lambda_function_name}-role")
+                try:
+                    add_sqs_policy_to_role(lambda_role_name, sqs_queue_arn)
+                    print(f"  ✓ SQS policy attached to role '{lambda_role_name}'")
+                except Exception as e:
+                    print(f"  Warning attaching SQS policy: {e}")
+
+                if use_s3express:
+                    try:
+                        add_s3express_bucket_policy(lambda_role_name, s3_bucket, region)
+                        print(f"  ✓ S3 Express policy attached to role '{lambda_role_name}'")
+                    except Exception as e:
+                        print(f"  Warning attaching S3 Express policy: {e}")
+
+                print("  Waiting for IAM propagation...")
+                time.sleep(10)
+
+                show_progress(step_idx)
+                print("  Removing any existing S3 bucket notification (prevents duplicate triggers)...")
+                remove_s3_notification(s3_bucket)
+
+                print("  Configuring SQS → Lambda trigger...")
+                try:
+                    configure_sqs_lambda_trigger(
+                        lambda_arn, sqs_queue_arn,
+                        batch_size=config.get("sqs_batch_size", 10),
+                        batch_window=config.get("sqs_batch_window", 0),
+                        region=region,
+                    )
+                    print("  ✓ SQS → Lambda trigger configured")
+                except Exception as e:
+                    print(f"  Warning: {e}")
+            else:
+                print("  Configuring S3 bucket notification...")
+                try:
+                    configure_s3_notification(s3_bucket, lambda_arn, lambda_function_name)
+                    print("  ✓ S3 trigger configured")
+                except Exception as e:
+                    print(f"  Warning: {e}")
+        steps[step_idx] = (steps[step_idx][0], True)
+        step_idx += 1
     
+    show_progress(step_idx)
     if create_vector_table:
         print("  Ensuring DynamoDB table exists...")
         create_vector_index_table(s3_bucket)
-        steps[4] = (steps[4][0], True)
-    show_progress(5)
+        steps[step_idx] = (steps[step_idx][0], True)
+    step_idx += 1
+    show_progress(step_idx)
     
     print("  Logging into ECR...")
     try:
@@ -479,13 +689,15 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
         print("  ✓ Logged into ECR")
     except Exception as e:
         print(f"  Warning: {e}")
-    steps[5] = (steps[5][0], True)
-    show_progress(6)
+    steps[step_idx] = (steps[step_idx][0], True)
+    step_idx += 1
+    show_progress(step_idx)
     
     print("  Generating Lithops config...")
     generate_lithops_config(region, s3_bucket, runtime_name, execution_role)
-    steps[6] = (steps[6][0], True)
-    show_progress(7)
+    steps[step_idx] = (steps[step_idx][0], True)
+    step_idx += 1
+    show_progress(step_idx)
     
     if build_runtime:
         dockerfile = Path(__file__).parent / "Dockerfile.lambda"
@@ -497,15 +709,26 @@ def run_setup(s3_bucket, config_overrides=None, create_vector_table=True, build_
             except Exception as e:
                 print(f"  Runtime build failed: {e}")
     
-    steps[7] = (steps[7][0], True)
+    steps[step_idx] = (steps[step_idx][0], True)
     show_progress(len(steps) - 1)
     
     print(f"\n✓ Setup complete!")
-    print(f"\nNext steps:")
-    print(f"  1. blocks-db configure --bucket {s3_bucket} --region {region}")
-    print(f"  2. blocks-db initialize-database mydata vectors.csv --config config.json")
-    print(f"  3. blocks-db put mydata new_vectors.csv  (add more vectors)")
-    print(f"  4. blocks-db query mydata --file queries.csv  (search)")
+    next_steps = [
+        f"  1. blocks-db configure --bucket {s3_bucket} --region {region}",
+        f"  2. blocks-db initialize-database mydata vectors.csv --config config.json",
+    ]
+    if use_sqs or not use_s3express:
+        next_steps += [
+            f"  3. blocks-db put mydata new_vectors.csv  (add more vectors)",
+        ]
+    next_steps += [
+        f"  {len(next_steps)+1}. blocks-db query mydata --file queries.csv  (search)",
+    ]
+    for s in next_steps:
+        print(s)
+
+    if use_sqs and sqs_queue_url:
+        print(f"\n  SQS Queue: {sqs_queue_url}")
 
 
 def create_lambda_manually(s3_bucket, layer_arn=None, function_name=None):
@@ -878,6 +1101,19 @@ def deploy_lambda_code(function_name=None):
 
 
 
+def remove_s3_notification(s3_bucket):
+    """Remove any S3 bucket notification configuration to avoid duplicate triggers."""
+    s3_client = boto3.client("s3")
+    try:
+        s3_client.put_bucket_notification_configuration(
+            Bucket=s3_bucket,
+            NotificationConfiguration={}
+        )
+        print(f"  Removed S3 notification configuration from bucket: {s3_bucket}")
+    except Exception as e:
+        print(f"  Warning: Could not remove S3 notification: {e}")
+
+
 def configure_s3_notification(s3_bucket, lambda_arn, function_name=None):
     """Configure S3 bucket to trigger Lambda on CSV uploads to pending/ folder only."""
     config = get_infra_config()
@@ -962,8 +1198,19 @@ def update_lambda_threshold(threshold_bytes: int = None, dataset_name: str = Non
     """
     lambda_client = boto3.client("lambda")
     config = get_infra_config()
-    
-    function_name = config.get("lambda_function_name")
+
+    # Use the actual Lambda function name from backend config (if set),
+    # falling back to the hard-coded default
+    backend_config_path = Path.home() / ".blocks-db-config" / "backend_config.json"
+    if backend_config_path.exists():
+        try:
+            with open(backend_config_path) as f:
+                backend_config = json.load(f)
+            function_name = backend_config.get("lambda_function_name") or config.get("lambda_function_name")
+        except Exception:
+            function_name = config.get("lambda_function_name")
+    else:
+        function_name = config.get("lambda_function_name")
     
     if dataset_name and s3_bucket and threshold_bytes is None:
         config_key = f"indexes/{dataset_name}/blocks/config.json"
@@ -1028,7 +1275,7 @@ def create_infrastructure_manually(s3_bucket, create_vector_table=True):
     
     print("\n2. Creating S3 prefixes...")
     s3_client = boto3.client("s3")
-    prefixes = ["pending/", "inputs/", "indexes/"]
+    prefixes = ["pending/", "inputs/", "indexes/", "datasets/", "tracking/"]
     for prefix in prefixes:
         try:
             s3_client.put_object(Bucket=s3_bucket, Key=prefix, Body=b"")
@@ -1071,13 +1318,7 @@ def create_vector_index_table(bucket=None):
         table.meta.client.get_waiter("table_exists").wait(TableName=table_name)
         print(f"  Created DynamoDB table: {table_name}")
         
-        table.put_item(Item={
-            "centroid_id": "GLOBAL",
-            "sk": "META",
-            "current_centroid_id": 0,
-            "current_accumulated_size": 0,
-        })
-        print(f"  Initialized global metadata")
+        print(f"  Skipped global metadata init (per-dataset config created on first use)")
         
     except dynamodb.meta.client.exceptions.ResourceInUseException:
         print(f"  DynamoDB table already exists: {table_name}")
@@ -1088,6 +1329,8 @@ def create_vector_index_table(bucket=None):
         try:
             s3_client.put_object(Bucket=bucket, Key="pending/", Body=b"")
             s3_client.put_object(Bucket=bucket, Key="inputs/", Body=b"")
+            s3_client.put_object(Bucket=bucket, Key="datasets/", Body=b"")
+            s3_client.put_object(Bucket=bucket, Key="tracking/", Body=b"")
             print(f"  Created S3 prefixes for bucket: {bucket}")
         except Exception as e:
             print(f"  Warning: Could not create S3 prefixes: {e}")

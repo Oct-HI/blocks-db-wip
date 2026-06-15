@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import boto3
 import numpy as np
 import csv
@@ -24,22 +25,73 @@ from .utils.index_ops import (
 )
 
 from .utils.vector_tracking import VectorIndexTracker
-from .utils.hybrid_search import brute_force_search, merge_search_results
+
 
 from .serverless_vectordb import ServerlessVectorDB
+
+BLOCK_SIZE = 500000  # ~500KB per block for CSV blocks
+
+
+def build_csv_blocks_from_local(csv_path: str):
+    """Read a local CSV file and build csv_blocks (byte-offset chunks) + last_vid.
+
+    Returns (blocks, last_vid).
+    """
+    blocks = []
+    current_offset = 0
+    current_block_start_id = None
+    current_block_size = 0
+    last_vid = None
+
+    with open(csv_path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            id_str = line.split(",")[0]
+            vec_id = int(id_str)
+
+            if current_block_start_id is None:
+                current_block_start_id = vec_id
+
+            current_block_size += len(line) + 1
+
+            if current_block_size >= BLOCK_SIZE:
+                blocks.append({
+                    "start_id": current_block_start_id,
+                    "end_id": vec_id,
+                    "offset": current_offset,
+                    "size": current_block_size
+                })
+                current_offset += current_block_size
+                current_block_start_id = None
+                current_block_size = 0
+
+            last_vid = vec_id
+
+    if current_block_start_id is not None and last_vid is not None:
+        blocks.append({
+            "start_id": current_block_start_id,
+            "end_id": last_vid,
+            "offset": current_offset,
+            "size": current_block_size
+        })
+
+    return blocks, last_vid
 from .infra import refresh_lithops_credentials
+from .utils.s3_utils import is_s3express_bucket
 
 class VectorDBClient:
 
-    def __init__(self, bucket: str, region: str = None):
+    def __init__(self, bucket: str, region: str = None, sqs_queue_url: str = None):
         self.bucket = bucket
+        self.sqs_queue_url = sqs_queue_url
 
         if region:
             self.s3 = boto3.client("s3", region_name=region)
         else:
             self.s3 = boto3.client("s3")
-        
-        self.tracker = VectorIndexTracker(bucket, region)
+
+        self.tracker = VectorIndexTracker(bucket, region, sqs_queue_url=sqs_queue_url)
 
     def create_dataset(self, name: str, csv_path: str):
         """
@@ -59,7 +111,7 @@ class VectorDBClient:
         self.tracker.delete_tracking(name)
         print(f"Dataset '{name}' deleted.")
 
-    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], auto_index: bool = False):
+    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], auto_index: bool = False, tags: dict = None):
         """
         Add new vectors to the pending storage (not yet indexed).
         
@@ -67,17 +119,18 @@ class VectorDBClient:
             dataset_name: Name of the dataset
             vectors: List of (id, vector) tuples
             auto_index: If True and threshold reached, trigger indexing (requires Lambda setup)
+            tags: Optional dict of key-value tags (e.g. {"source": "web"})
             
         Returns:
             Number of vectors added
         """
-        count = self.tracker.put_vectors(dataset_name, vectors)
+        count = self.tracker.put_vectors(dataset_name, vectors, tags=tags)
         print(f"Added {count} vectors to pending storage for dataset '{dataset_name}'.")
         return count
 
-    def put_vector(self, dataset_name: str, vector_id: int, vector: List[float]):
+    def put_vector(self, dataset_name: str, vector_id: int, vector: List[float], tags: dict = None):
         """Add a single vector to pending storage."""
-        return self.put_vectors(dataset_name, [(vector_id, vector)])
+        return self.put_vectors(dataset_name, [(vector_id, vector)], tags=tags)
 
     def get_pending_vectors(self, dataset_name: str) -> List[Tuple[int, List[float]]]:
         """Get all vectors that are pending indexing."""
@@ -111,7 +164,7 @@ class VectorDBClient:
         List all datasets in bucket following naming convention.
         """
 
-        response = self.s3.list_objects_v2(Bucket=self.bucket)
+        response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix="datasets/")
 
         datasets = []
 
@@ -121,8 +174,8 @@ class VectorDBClient:
         for obj in response["Contents"]:
             key = obj["Key"]
 
-            if key.startswith("vectors_") and key.endswith(".csv"):
-                name = key.replace("vectors_", "").replace(".csv", "")
+            if key.endswith("/source.csv"):
+                name = key.split("/")[1]
                 datasets.append(name)
 
         return datasets
@@ -144,7 +197,7 @@ class VectorDBClient:
     def list_indexes(self, dataset_name: str):
         return list_indexes(self.bucket, dataset_name)
     
-    def index_dataset(self, dataset_name: str, config: dict, num_workers: int = 16, save_config: bool = True, track_indexed: bool = True):
+    def index_dataset(self, dataset_name: str, config: dict, num_workers: int = 16, save_config: bool = True, track_indexed: bool = True, setup_auto_indexer: bool = True, csv_blocks: tuple = None):
         """
         Run indexing for a dataset using provided configuration.
 
@@ -154,6 +207,10 @@ class VectorDBClient:
             num_workers (int): Number of workers for parallel indexing.
             save_config (bool): If True, saves the index configuration to S3 after indexing.
             track_indexed (bool): If True, tracks indexed vector IDs for hybrid queries.
+            setup_auto_indexer (bool): If True, initializes DynamoDB state and vector tracking for auto-indexer.
+                                       Set False for pure benchmark comparisons.
+            csv_blocks (tuple, optional): (blocks, last_vid) pre-built from local file.
+                                          If provided, avoids re-downloading CSV from S3.
         Returns:
             dict: Timing stats from the indexing process.
         """
@@ -164,7 +221,7 @@ class VectorDBClient:
         print(f"Initializing ServerlessVectorDB for dataset '{dataset_name}'...")
         sv_vectordb = ServerlessVectorDB(**config)
 
-        filename = f"vectors_{dataset_name}.csv"
+        filename = f"datasets/{dataset_name}/source.csv"
 
         print("Starting indexing...")
         total_times = sv_vectordb.indexing(filename, num_workers)
@@ -179,34 +236,42 @@ class VectorDBClient:
         bytes_per_vector = 8 + (features * 8)
         vectors_per_block = total_vectors // num_index
         bytes_per_block = vectors_per_block * bytes_per_vector
+
+        use_s3express = is_s3express_bucket(self.bucket)
         
-        print(f"\nAuto-indexer block size info:")
+        print(f"\nBlock size info:")
         print(f"  Total vectors: {total_vectors:,}")
         print(f"  Features: {features}")
         print(f"  Bytes per vector: {bytes_per_vector}")
         print(f"  Blocks: {num_index}")
         print(f"  Vectors per block: {vectors_per_block:,}")
         print(f"  Bytes per block: {bytes_per_block:,}")
-        print(f"\nTo sync Lambda threshold, run:")
-        print(f"  blocks-db update-threshold {bytes_per_block} --dataset {dataset_name} --bucket {self.bucket}")
-        print(f"  (or just: blocks-db update-threshold --dataset {dataset_name} --bucket {self.bucket} for auto)")
+
+        if not use_s3express:
+            print(f"\nTo sync Lambda threshold, run:")
+            print(f"  blocks-db update-threshold {bytes_per_block} --dataset {dataset_name} --bucket {self.bucket}")
 
         if save_config:
             config["total_vectors"] = total_vectors
             config["bytes_per_vector"] = bytes_per_vector
             config["bytes_per_block"] = bytes_per_block
+            t0 = time.time()
             self.save_index_config(dataset_name, config)
-            self._setup_auto_indexer_state(dataset_name, config)
+            if setup_auto_indexer:
+                self._setup_auto_indexer_state(dataset_name, config)
+            total_times["save_config"] = time.time() - t0
 
-        if track_indexed:
-            self._track_indexed_vectors_from_csv(dataset_name, features)
+        if track_indexed and setup_auto_indexer:
+            t0 = time.time()
+            self._track_indexed_vectors_from_csv(dataset_name, features, use_s3express=use_s3express, prebuilt_blocks=csv_blocks)
+            total_times["tracking_time"] = time.time() - t0
 
         return total_times
     
     def _get_vector_count(self, dataset_name: str) -> int:
         """Count total vectors in dataset."""
         s3 = boto3.client("s3")
-        key = f"vectors_{dataset_name}.csv"
+        key = f"datasets/{dataset_name}/source.csv"
         try:
             response = s3.get_object(Bucket=self.bucket, Key=key)
             content = response['Body'].read().decode('utf-8')
@@ -233,7 +298,7 @@ class VectorDBClient:
             num_index = config.get("num_index", 16)
             
             table.update_item(
-                Key={"centroid_id": "GLOBAL_CONFIG", "sk": "META"},
+                Key={"centroid_id": f"{dataset_name}_CONFIG", "sk": "META"},
                 UpdateExpression="SET current_accumulated_size = :zero, current_centroid_id = :next",
                 ExpressionAttributeValues={":zero": 0, ":next": num_index}
             )
@@ -278,7 +343,7 @@ class VectorDBClient:
         config["storage_bucket"] = self.bucket
         
         sv_vectordb = ServerlessVectorDB(**config)
-        filename = f"vectors_{dataset_name}.csv"
+        filename = f"datasets/{dataset_name}/source.csv"
         
         print("Rebuilding indexes with pending vectors...")
         total_times = sv_vectordb.indexing(filename, num_workers)
@@ -320,10 +385,26 @@ class VectorDBClient:
         self.tracker.mark_vectors_indexed(dataset_name, pending_ids)
         print(f"Marked {len(pending_ids)} pending vectors as indexed for hybrid search.")
 
-    def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int):
-        """Read the main CSV and track all vectors as indexed + build csv_blocks for optimized get."""
-        key = f"vectors_{dataset_name}.csv"
-        indexed_ids = []
+    def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int, use_s3express: bool = False, prebuilt_blocks: tuple = None):
+        """Read the main CSV and track all vectors as indexed + build csv_blocks for optimized get.
+
+        If prebuilt_blocks=(blocks, last_vid) is provided, skip S3 download
+        and use the pre-built blocks instead.
+        """
+        if prebuilt_blocks is not None:
+            blocks, last_vid = prebuilt_blocks
+            if blocks:
+                blocks_key = f"tracking/csv_blocks_{dataset_name}.json"
+                self.s3.put_object(Bucket=self.bucket, Key=blocks_key, Body=json.dumps(blocks))
+                print(f"Stored {len(blocks)} pre-built CSV blocks for optimized get.")
+            if last_vid is not None:
+                next_id = last_vid + 1
+                self.tracker.initialize_next_id(dataset_name, next_id)
+                print(f"Tracked {next_id} vectors as indexed (from local file).")
+                print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
+            return
+
+        key = f"datasets/{dataset_name}/source.csv"
         block_size = 500000  # ~500KB per block
         blocks = []
 
@@ -346,7 +427,6 @@ class VectorDBClient:
                 line = raw_line.decode()
                 id_str = line.split(",")[0]
                 vec_id = int(id_str)
-                indexed_ids.append(vec_id)
 
                 if current_block_start_id is None:
                     current_block_start_id = vec_id
@@ -375,16 +455,14 @@ class VectorDBClient:
                 })
 
             if blocks:
-                blocks_key = f"csv_blocks_{dataset_name}.json"
+                blocks_key = f"tracking/csv_blocks_{dataset_name}.json"
                 self.s3.put_object(Bucket=self.bucket, Key=blocks_key, Body=json.dumps(blocks))
                 print(f"Built {len(blocks)} CSV blocks for optimized get.")
 
-            if indexed_ids:
-                self.tracker.create_indexed_tracking(dataset_name, indexed_ids)
-                # Initialize DynamoDB counter for atomic ID tracking
-                next_id = max(indexed_ids) + 1
+            if last_vid is not None:
+                next_id = last_vid + 1
                 self.tracker.initialize_next_id(dataset_name, next_id)
-                print(f"Tracked {len(indexed_ids)} vectors as indexed.")
+                print(f"Tracked {next_id} vectors as indexed.")
                 print(f"Initialized DynamoDB next_id={next_id} for atomic ID tracking.")
         except Exception as e:
             print(f"Warning: Could not track indexed vectors: {e}")
@@ -422,7 +500,7 @@ class VectorDBClient:
 
         print(f"Deleted {deleted_count} config(s) for dataset '{dataset_name}'")
     
-    def query(self, dataset_name: str, vector: List[float], k: int = None, hybrid: bool = True):
+    def query(self, dataset_name: str, vector: List[float], k: int = None, hybrid: bool = True, batch_size: int = None, filter_tags: dict = None):
         """
         Query a single vector. Always searches everything (indexed + pending).
         
@@ -431,14 +509,16 @@ class VectorDBClient:
             vector: Query vector (list of floats)
             k: Number of results (defaults to config k_result)
             hybrid: If True, include pending vectors in search (default: True)
+            batch_size: Override query_batch_size for this query
+            filter_tags: Optional dict of tag filters (e.g. {"source": "web"}). Only centroids/pending files matching ALL tags are searched.
             
         Returns:
             List of (id, distance) tuples sorted by distance
         """
-        results, times = self.query_batch(dataset_name, [vector], k=k, hybrid=hybrid)
+        results, times = self.query_batch(dataset_name, [vector], k=k, hybrid=hybrid, batch_size=batch_size, filter_tags=filter_tags)
         return results[0], times
 
-    def query_batch(self, dataset_name: str, vectors: List[List[float]], k: int = None, hybrid: bool = True):
+    def query_batch(self, dataset_name: str, vectors: List[List[float]], k: int = None, hybrid: bool = True, batch_size: int = None, filter_tags: dict = None):
         """
         Query multiple vectors. Always searches everything (indexed + pending) by default.
         
@@ -447,6 +527,8 @@ class VectorDBClient:
             vectors: List of query vectors
             k: Number of results per query
             hybrid: If True, include pending vectors in search (default: True)
+            batch_size: Override query_batch_size for this query
+            filter_tags: Optional dict of tag filters (e.g. {"source": "web"}). Only centroids/pending files matching ALL tags are searched.
             
         Returns:
             neighbours, times
@@ -458,11 +540,11 @@ class VectorDBClient:
         vectors_np = np.array(vectors)
         
         if hybrid:
-            return self._query_hybrid(dataset_name, vectors_np, k)
+            return self._query_hybrid(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
         else:
-            return self._query_indexed_only(dataset_name, vectors_np, k)
+            return self._query_indexed_only(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
     
-    def query_indexed_only(self, dataset_name: str, vector: List[float] = None, vectors: List[List[float]] = None, k: int = None):
+    def query_indexed_only(self, dataset_name: str, vector: List[float] = None, vectors: List[List[float]] = None, k: int = None, batch_size: int = None, filter_tags: dict = None):
         """
         Query only the indexed vectors (no pending).
         
@@ -471,6 +553,8 @@ class VectorDBClient:
             vector: Single query vector
             vectors: Multiple query vectors (alternative to single vector)
             k: Number of results
+            batch_size: Override query_batch_size for this query
+            filter_tags: Optional dict of tag filters (e.g. {"source": "web"})
             
         Returns:
             Search results from indexed data only
@@ -482,15 +566,17 @@ class VectorDBClient:
         else:
             raise ValueError("Provide either vector or vectors")
         
-        return self._query_indexed_only(dataset_name, np.array(vecs), k)
+        return self._query_indexed_only(dataset_name, np.array(vecs), k, batch_size=batch_size, filter_tags=filter_tags)
 
-    def _query_indexed_only(self, dataset_name: str, vectors_np: np.ndarray, k: int = None):
+    def _query_indexed_only(self, dataset_name: str, vectors_np: np.ndarray, k: int = None, batch_size: int = None, filter_tags: dict = None):
         """Query only the FAISS index (no pending vectors)."""
         k = k if k is not None else self._get_k_result(dataset_name)
         
         try:
-            sv_vectordb = self._load_default_index(dataset_name)
-            neighbours, times = sv_vectordb.search(0, vectors_np)
+            sv_vectordb = self._load_default_index(dataset_name, batch_size=batch_size, filter_tags=filter_tags)
+            neighbours, times = sv_vectordb.search(0, vectors_np, filter_tags=filter_tags)
+            if not neighbours:
+                neighbours = [[] for _ in range(len(vectors_np))]
         except ValueError as e:
             print(f"No index available: {e}")
             neighbours = [[] for _ in range(len(vectors_np))]
@@ -498,40 +584,37 @@ class VectorDBClient:
         
         return neighbours, times
 
-    def _query_hybrid(self, dataset_name: str, vectors_np: np.ndarray, k: int = None):
+    def _query_hybrid(self, dataset_name: str, vectors_np: np.ndarray, k: int = None, batch_size: int = None, filter_tags: dict = None):
         """Internal hybrid query implementation."""
         k = k if k is not None else self._get_k_result(dataset_name)
-        
-        indexed_results = None
-        indexed_times = None
-        
+
         try:
-            sv_vectordb = self._load_default_index(dataset_name)
-            indexed_results, indexed_times = sv_vectordb.search(0, vectors_np)
-        except ValueError as e:
-            print(f"No index available: {e}")
-            indexed_results = [[] for _ in range(len(vectors_np))]
-            indexed_times = {"error": str(e)}
-        
-        unindexed_results = None
-        
-        if self.has_pending_vectors(dataset_name):
+            sv_vectordb = self._load_default_index(dataset_name, batch_size=batch_size, filter_tags=filter_tags)
+            results, times = sv_vectordb.search(0, vectors_np, filter_tags=filter_tags)
+        except ValueError:
+            results = None
+            times = {"error": "no index available"}
+
+        if not results and self.has_pending_vectors(dataset_name):
+            from .utils.hybrid_search import brute_force_search
             unindexed = self.get_pending_vectors(dataset_name)
             if unindexed:
-                unindexed_results = brute_force_search(vectors_np, unindexed, k)
-        
-        if unindexed_results is None:
-            merged = indexed_results
-        else:
-            merged = merge_search_results(indexed_results, unindexed_results, k)
-        
-        times = indexed_times if indexed_times else {}
+                results = brute_force_search(vectors_np, unindexed, k)
+                for r in results:
+                    r[:] = [(vid, dist, "pending") for vid, dist in r]
+                times = {"fallback": "no index, searched pending only"}
+
+        if not results:
+            results = [[] for _ in range(len(vectors_np))]
+
         times["hybrid_search"] = True
-        times["has_unindexed"] = unindexed_results is not None
-        
-        return merged, times
+        times["has_pending"] = self.has_pending_vectors(dataset_name)
+        if filter_tags:
+            times["filter_tags"] = filter_tags
+
+        return results, times
     
-    def query_from_file(self, dataset_name: str, csv_path: str, hybrid: bool = True, k: int = None):
+    def query_from_file(self, dataset_name: str, csv_path: str, hybrid: bool = True, k: int = None, batch_size: int = None, filter_tags: dict = None):
         """
         Query ALL vectors from a CSV file. Always searches everything by default.
         
@@ -540,6 +623,8 @@ class VectorDBClient:
             csv_path: Path to CSV file with query vectors (space-separated floats per row)
             hybrid: If True, include pending vectors (default: True)
             k: Number of results per query
+            batch_size: Override query_batch_size for this query
+            filter_tags: Optional dict of tag filters (e.g. {"source": "web"})
             
         Returns:
             neighbours, times
@@ -564,11 +649,11 @@ class VectorDBClient:
         vectors_np = np.array(vectors)
         
         if hybrid:
-            return self._query_hybrid(dataset_name, vectors_np, k)
+            return self._query_hybrid(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
         else:
-            return self._query_indexed_only(dataset_name, vectors_np, k)
+            return self._query_indexed_only(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
 
-    def query_hybrid(self, dataset_name: str, vectors: List[List[float]], k: int = None):
+    def query_hybrid(self, dataset_name: str, vectors: List[List[float]], k: int = None, batch_size: int = None, filter_tags: dict = None):
         """
         Explicit hybrid query - searches both indexed and pending vectors.
         Alias for query_batch with hybrid=True.
@@ -577,45 +662,13 @@ class VectorDBClient:
             dataset_name: Name of the dataset
             vectors: List of query vectors
             k: Number of results per query (defaults to config k_result)
+            batch_size: Override query_batch_size for this query
+            filter_tags: Optional dict of tag filters (e.g. {"source": "web"})
             
         Returns:
             Merged search results with (id, distance) tuples
         """
-        return self.query_batch(dataset_name, vectors, k=k, hybrid=True)
-
-    def _query_hybrid(self, dataset_name: str, vectors_np: np.ndarray, k: int = None):
-        """Internal hybrid query implementation."""
-        k = k if k is not None else self._get_k_result(dataset_name)
-        
-        indexed_results = None
-        indexed_times = None
-        
-        try:
-            sv_vectordb = self._load_default_index(dataset_name)
-            indexed_results, indexed_times = sv_vectordb.search(0, vectors_np)
-        except ValueError as e:
-            print(f"No index available: {e}")
-            indexed_results = [[] for _ in range(len(vectors_np))]
-            indexed_times = {}
-        
-        unindexed_results = None
-        unindexed_times = {}
-        
-        if self.has_pending_vectors(dataset_name):
-            unindexed = self.get_pending_vectors(dataset_name)
-            if unindexed:
-                unindexed_results = brute_force_search(vectors_np, unindexed, k)
-        
-        if unindexed_results is None:
-            merged = indexed_results
-        else:
-            merged = merge_search_results(indexed_results, unindexed_results, k)
-        
-        times = indexed_times if indexed_times else {}
-        times["hybrid_search"] = True
-        times["has_unindexed"] = unindexed_results is not None
-        
-        return merged, times
+        return self.query_batch(dataset_name, vectors, k=k, hybrid=True, batch_size=batch_size, filter_tags=filter_tags)
 
     def _get_k_result(self, dataset_name: str) -> int:
         """Get k_result from index config."""
@@ -640,7 +693,7 @@ class VectorDBClient:
         implementation, num_index = indexes[0]
         return load_index_config(self.bucket, dataset_name, implementation, num_index)
     
-    def _load_default_index(self, dataset_name: str):
+    def _load_default_index(self, dataset_name: str, batch_size: int = None, filter_tags: dict = None):
         """
         Load the only stored index config for a dataset.
         Raises error if none or more than one exist.
@@ -668,5 +721,12 @@ class VectorDBClient:
 
         config["dataset"] = dataset_name
         config["storage_bucket"] = self.bucket
+        config["dynamodb_table_name"] = self.tracker.DYNAMODB_TABLE_NAME
+        config["dynamodb_region"] = self.tracker.dynamodb.meta.client.meta.region_name
+
+        if batch_size is not None:
+            config["query_batch_size"] = batch_size
+        if filter_tags is not None:
+            config["filter_tags"] = filter_tags
 
         return ServerlessVectorDB(**config)

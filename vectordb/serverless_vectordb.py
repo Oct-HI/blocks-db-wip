@@ -17,5 +17,5 @@ class ServerlessVectorDB():
             return initialize_database(filename, self.params, self.indexing_executor, num_workers)
         return {}
         
-    def search(self, id, query_vector):
-        return self.orchestrator.search(id, query_vector, self.params.num_centroids_search, self.params.k_search, self.params.k_result)
+    def search(self, id, query_vector, filter_tags=None):
+        return self.orchestrator.search(id, query_vector, self.params.num_centroids_search, self.params.k_search, self.params.k_result, filter_tags=filter_tags)

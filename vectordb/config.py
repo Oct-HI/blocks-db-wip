@@ -12,6 +12,11 @@ class InfraConfig:
     layer_name: str = "blocksdb-layer-faiss-default"
     threshold_size_bytes: int = 5242880  # 5 MB
     runtime_name: str = "blocks-db-runtime"
+    sqs_use_sqs: bool = False
+    sqs_queue_name: str = "blocksdb-pending-default"
+    sqs_queue_url: str = None
+    sqs_batch_size: int = 10
+    sqs_batch_window: int = 0
 
 
 DEFAULT_INFRA_CONFIG = InfraConfig()
@@ -62,6 +67,12 @@ class SvlessVectorDBParams:
     auto_index_threshold_mb: Optional[int] = None
     dynamodb_table_name: str = "BlocksDB-VectorIndex"
     
+    # Tag filtering (per-query, not persisted)
+    filter_tags: dict = None
+
+    # DynamoDB connection info (injected at query time)
+    dynamodb_region: str = None
+
     # Extra fields from index config
     total_vectors: int = -1
     bytes_per_vector: int = 776
