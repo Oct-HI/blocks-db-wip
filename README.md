@@ -70,7 +70,30 @@ export AWS_DEFAULT_REGION=us-east-1
 blocks-db configure --bucket your-s3-bucket --region us-east-1
 ```
 
+For SQS-based auto-indexer:
+```bash
+blocks-db configure --bucket your-s3-bucket --region us-east-1 --sqs
+```
+
 This saves configuration to `~/.blocks-db-config/backend_config.json`.
+
+---
+
+## 🚦 Auto-Indexer Modes
+
+Blocks-DB supports three auto-indexer configurations, selected at `setup`:
+
+| Mode | `setup` flag | `configure` flag | Use case |
+|------|:------------:|:----------------:|----------|
+| **S3 Triggers** (default) | *(none)* | *(none)* | Standard S3 buckets with notification support |
+| **SQS** | `--sqs` | `--sqs` | Buckets without S3 notification support, or when you prefer queue-based triggers |
+| **S3 Express One Zone** | `--s3express` | *(auto-detected)* | S3 Express One Zone buckets (name ends in `--x-s3`). Auto-enables SQS since Express buckets don't support S3 notifications |
+
+### How it works
+
+- **S3 Triggers**: Uploading a CSV to `pending/<dataset>/` fires a Lambda notification directly.
+- **SQS**: The CLI sends a message to an SQS queue after each `put`. Lambda polls the queue. Includes a DLQ for failed messages.
+- **S3 Express**: Same as SQS, plus adds `s3express:CreateSession` permission to the Lambda role and auto-detects the availability zone from the bucket name.
 
 ---
 
@@ -79,25 +102,41 @@ This saves configuration to `~/.blocks-db-config/backend_config.json`.
 ### Setup: Create infrastructure
 
 ```bash
+# Default — S3 Triggers
 blocks-db setup --bucket your-s3-bucket
+
+# SQS mode
+blocks-db setup --bucket your-s3-bucket --sqs
+
+# S3 Express One Zone mode (auto-enables SQS)
+blocks-db setup --bucket your-bucket--use1-az6--x-s3 --s3express
 ```
 
 Creates:
 - Lambda Layer with FAISS
 - Lambda function for auto-indexing
 - DynamoDB table for index tracking
-- S3 triggers for auto-indexing
+- S3 triggers **or** SQS queue (+ DLQ) for auto-indexing
 - Lithops runtime in ECR
 
 **Customize names:**
 
 ```bash
 blocks-db setup --bucket your-s3-bucket \
-  --stack-name mi-stack \
   --runtime-name mi-runtime \
   --function-name mi-autoindexer \
   --table-name mi-tabla \
-  --layer-name mi-layer
+  --layer-name mi-layer \
+  --role-name mi-rol
+```
+
+**Other options:**
+```bash
+# Custom threshold (bytes) for auto-indexer block size
+blocks-db setup --bucket your-bucket --threshold 10485760
+
+# Skip DynamoDB table or Lithops runtime (if already built)
+blocks-db setup --bucket your-bucket --skip-vector-table --skip-runtime
 ```
 
 > **Warning:** Ensure these resources do not already exist, or the setup will fail or update existing resources.
@@ -156,9 +195,17 @@ This requires an **index config file**. Example (`config.json`):
 | `skip_kmeans` | Skip k-means clustering |
 | `kmeans_version` | K-means version |
 
-To skip auto-update threshold:
+**Options:**
+
 ```bash
+# Skip auto-update of Lambda threshold
 blocks-db initialize-database mydataset vectors.csv --config config.json --no-update-threshold
+
+# Build csv_blocks from local file (skip S3 re-download during tracking)
+blocks-db initialize-database mydataset vectors.csv --config config.json --build-local
+
+# Skip DynamoDB state init and vector tracking (benchmark purity)
+blocks-db initialize-database mydataset vectors.csv --config config.json --skip-auto-indexer
 ```
 
 After initializing, the threshold is automatically configured based on the initial config (num_index, features) and estimated vector size. This threshold controls the size of each block for auto-indexing — the system tries to get as close as possible to this size.
@@ -170,6 +217,18 @@ blocks-db put mydataset new_vectors.csv
 ```
 
 Vectors are stored as "pending" and included in searches automatically.
+
+**With metadata tags:**
+```bash
+blocks-db put mydataset new_vectors.csv --tags '{"source":"web","category":"news"}'
+```
+
+Tags are stored per batch and can be used to filter searches later. Each vector in the batch inherits the same tags.
+
+**Single-vector mode:**
+```bash
+blocks-db put mydataset single_vector.csv --single
+```
 
 ### Update threshold (after initialize-database)
 
@@ -198,6 +257,17 @@ By default searches in index + pending. For index-only search:
 blocks-db query mydataset --file queries.csv --indexed-only
 ```
 
+**Filtered search (requires tags on put):**
+```bash
+# Only search centroids and pending files matching ALL specified tags
+blocks-db query mydataset --file queries.csv --k 10 --filter '{"source":"web"}'
+```
+
+**Custom batch size** (number of centroid `.ann` files per map worker):
+```bash
+blocks-db query mydataset --file queries.csv --batch-size 2
+```
+
 ### Status
 
 ```bash
@@ -213,15 +283,15 @@ blocks-db status mydataset -v
 
 | Command | Description | Usage |
 |---------|-------------|-------|
-| `setup` | Create infrastructure (Lambda, DynamoDB, S3 triggers) | `blocks-db setup --bucket <bucket>` |
-| `configure` | Save default bucket and region | `blocks-db configure --bucket <bucket> --region us-east-1` |
+| `setup` | Create infrastructure (Lambda, DynamoDB, SQS/S3 triggers) | `blocks-db setup --bucket <b> [--sqs \| --s3express]` |
+| `configure` | Save default bucket and region | `blocks-db configure --bucket <b> --region <r> [--sqs]` |
 | `refresh-credentials` | Refresh AWS credentials in Lithops config | `blocks-db refresh-credentials` |
 | `update-threshold` | Update auto-indexer block size threshold | `blocks-db update-threshold [bytes] --dataset <name>` |
-| `initialize-database` | Upload dataset and build initial index | `blocks-db initialize-database <name> <csv> --config <json>` |
-| `put` | Add vectors to pending storage | `blocks-db put <name> <csv>` |
-| `query` | Search vectors (indexed + pending by default) | `blocks-db query <name> --file <csv> --k 10` |
+| `initialize-database` | Upload dataset and build initial index | `blocks-db initialize-database <n> <csv> --config <j> [--build-local]` |
+| `put` | Add vectors to pending storage | `blocks-db put <name> <csv> [--tags <json>] [--single]` |
+| `query` | Search vectors (indexed + pending by default) | `blocks-db query <n> --file <csv> --k <N> [--filter <j>] [--batch-size <N>]` |
 | `status` | Show dataset status and index info | `blocks-db status <name> [-v]` |
-| `get` | Retrieve vectors by ID, list vectors, or show pending | `blocks-db get <name> <id>... [--limit N] [--pending]` |
+| `get` | Retrieve vectors by ID, list vectors, or show pending | `blocks-db get <n> <id>... [--limit N] [--pending]` |
 
 ### `get` command usage
 
@@ -255,14 +325,16 @@ First column: ID (integer), rest: space-separated values.
 
 ```
 your-bucket/
-├── vectors_<dataset>.csv    # Main dataset
-├── pending/                 # Pending vectors
-├── processed/               # Already processed
-│   └── ...
-├── indexes/<dataset>/<impl>/
-│   ├─config.json
-│   └── centroid_*.ann      # Index blocks
-└── inputs/                 # Temporary data
+├── vectors_<dataset>.csv              # Main dataset
+├── csv_blocks_<dataset>.json          # Block index for fast ID lookup
+├── pending/<dataset>/                 # Pending vectors (individual CSVs)
+├── processed/<dataset>/               # Processed pending batches
+├── tracking/                          # Vector tracking metadata
+├── indexes/<dataset>/blocks/
+│   ├── config.json
+│   └── centroid_*.ann                 # FAISS index blocks
+├── datasets/<dataset>/source.csv      # Alternative dataset path
+└── inputs/                            # Temporary Lithops data
 ```
 
 ---
@@ -290,14 +362,18 @@ Blocks-DB needs the following permissions (created automatically by `setup`):
 - **DynamoDB**: create table and write
 - **ECR**: push images
 - **IAM**: roles for Lambda
+- **SQS** (if `--sqs` or `--s3express`): create queues, event source mappings
+- **S3 Express** (if `--s3express`): `s3express:CreateSession` on the bucket
 
 ---
 
 ## 📝 Notes
 
-- Auto-indexer Lambda triggers when you upload CSV to `pending/` in S3
-- Default search is hybrid (index + pending)
-- Use `--indexed-only` to search only the existing index
+- **Auto-indexer**: In S3 Triggers mode, uploading a CSV to `pending/<dataset>/` fires the Lambda. In SQS mode, the CLI posts a message after each `put`.
+- **S3 Express One Zone**: Bucket name must end with `--<az>--x-s3` (auto-detected). Uses SQS since Express buckets don't support S3 notifications.
+- **Tag filtering**: Requires DynamoDB. Tags are stored per pending file; centroids aggregate tags from all their pending files. Only centroids and pending files matching ALL filter tags are searched.
+- **Default search** is hybrid (index + pending). Use `--indexed-only` to search only the existing index.
+- **Threshold**: Controls the accumulated pending size (in bytes) that triggers the auto-indexer. Auto-calculated from dataset config or set manually.
 
 ---
 
