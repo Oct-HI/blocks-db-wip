@@ -5,9 +5,7 @@ import os
 import time
 from pathlib import Path
 
-import boto3
-
-from .client import VectorDBClient, build_csv_blocks_from_local
+from .client import VectorDBClient
 from .infra import run_setup, refresh_lithops_credentials, get_infra_config
 from .config import DEFAULT_INFRA_CONFIG
 from .utils.s3_utils import is_s3express_bucket, parse_express_az
@@ -47,8 +45,6 @@ def main():
     setup_parser.add_argument("--threshold", type=int, default=None, help="Auto-indexer threshold in bytes (default: 5242880)")
     setup_parser.add_argument("--skip-vector-table", action="store_true", help="Skip DynamoDB table creation")
     setup_parser.add_argument("--skip-runtime", action="store_true", help="Skip Lithops runtime build")
-    setup_parser.add_argument("--s3express", action="store_true", help="Use S3 Express One Zone (auto-enables SQS)")
-    setup_parser.add_argument("--sqs", action="store_true", help="Use SQS instead of S3 notifications for auto-indexer trigger")
 
     # ── update-threshold ─────────────────────────────────────
     threshold_parser = subparsers.add_parser("update-threshold", help="Update auto-indexer block size threshold")
@@ -65,7 +61,6 @@ def main():
     configure_parser = subparsers.add_parser("configure", help="Save default bucket and region")
     configure_parser.add_argument("--bucket", required=True, help="Default S3 bucket")
     configure_parser.add_argument("--region", default="us-east-1", help="AWS region")
-    configure_parser.add_argument("--sqs", action="store_true", help="Use SQS for auto-indexer notifications")
 
     # ── initialize-database ───────────────────────────────────
     init_parser = subparsers.add_parser("initialize-database", help="Upload initial dataset and create index")
@@ -74,15 +69,12 @@ def main():
     init_parser.add_argument("--config", required=True, help="Path to index config JSON")
     init_parser.add_argument("--workers", type=int, default=16, help="Number of indexing workers")
     init_parser.add_argument("--no-update-threshold", action="store_true", help="Skip auto-update threshold after indexing")
-    init_parser.add_argument("--skip-auto-indexer", action="store_true", help="Skip DynamoDB state init and vector tracking (for pure benchmarks)")
-    init_parser.add_argument("--build-local", action="store_true", help="Build csv_blocks from local file (skip S3 re-download during tracking)")
 
     # ── put ───────────────────────────────────────────────────
     put_parser = subparsers.add_parser("put", help="Add new vectors (stored as individual files)")
     put_parser.add_argument("name", help="Dataset name")
     put_parser.add_argument("csv_path", help="CSV file with vectors (id, vector values)")
     put_parser.add_argument("--single", action="store_true", help="Treat as single vector per file (one vector per file)")
-    put_parser.add_argument("--tags", type=str, default=None, help='JSON dict of tags (e.g. \'{"source":"web","category":"news"}\')')
 
     # ── query ─────────────────────────────────────────────────
     query_parser = subparsers.add_parser("query", help="Query vectors (searches indexed + pending)")
@@ -139,11 +131,6 @@ def main():
     client = None
     if args.command not in commands_without_bucket:
         client = VectorDBClient(bucket=bucket, region=region, sqs_queue_url=sqs_queue_url)
-
-    def _fmt_result(r):
-        if len(r) == 3:
-            return f"(id={r[0]}, dist={r[1]:.4f}, src={r[2]})"
-        return str(r)
 
     # ── setup ────────────────────────────────────────────────
     if args.command == "setup":
@@ -236,18 +223,8 @@ def main():
     elif args.command == "initialize-database":
         print(f"\n=== Uploading dataset '{args.name}' ===")
 
-        csv_blocks = None
-        if args.build_local:
-            t0 = time.time()
-            csv_blocks = build_csv_blocks_from_local(args.csv_path)
-            local_build_time = time.time() - t0
-            blocks, last_vid = csv_blocks
-            print(f"Built {len(blocks)} csv_blocks from local file (last_vid={last_vid}) in {local_build_time:.3f}s.")
-
-        t0 = time.time()
         client.create_dataset(args.name, args.csv_path)
-        upload_time = time.time() - t0
-        print(f"Dataset uploaded in {upload_time:.3f}s.")
+        print(f"Dataset uploaded.")
 
         with open(args.config) as f:
             config = json.load(f)
@@ -264,7 +241,6 @@ def main():
         print(f"Index built successfully.")
         print(f"Timing: {json.dumps(times, indent=2)}")
 
-        use_s3express = is_s3express_bucket(bucket) if bucket else False
         if not args.no_update_threshold:
             print(f"\n=== Updating auto-indexer threshold ===")
             from .infra import update_lambda_threshold
@@ -277,10 +253,6 @@ def main():
     # ── put ───────────────────────────────────────────────────
     elif args.command == "put":
         from .utils.vector_utils import load_vectors_with_ids_from_csv, load_vectors_from_csv
-
-        tags = json.loads(args.tags) if args.tags else None
-        if tags:
-            print(f"Tags: {tags}")
 
         print(f"\n=== Putting vectors into '{args.name}' ===")
 
@@ -319,9 +291,6 @@ def main():
         print(f"\n=== Querying '{args.name}' ===")
 
         hybrid = not args.indexed_only
-        filter_tags = json.loads(args.filter) if args.filter else None
-        if filter_tags:
-            print(f"Filter tags: {filter_tags}")
 
         if args.vector:
             vector = [float(x) for x in args.vector.split()]
@@ -338,8 +307,6 @@ def main():
             if len(results) > 5:
                 print(f"  ... and {len(results) - 5} more queries")
 
-        if args.batch_size:
-            print(f"Batch size: {args.batch_size} (override)")
         print(f"\nSearch mode: {'hybrid (indexed + pending)' if hybrid else 'indexed only'}")
         if filter_tags:
             print(f"Filter tags: {filter_tags}")
