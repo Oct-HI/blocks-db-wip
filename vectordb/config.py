@@ -70,6 +70,9 @@ class SvlessVectorDBParams:
     # Tag filtering (per-query, not persisted)
     filter_tags: dict = None
 
+    # Post-filter overfetch multiplier (k * overfetch candidates before tag filter)
+    post_filter_overfetch: int = 3
+
     # DynamoDB connection info (injected at query time)
     dynamodb_region: str = None
 

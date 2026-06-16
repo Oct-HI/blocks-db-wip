@@ -1,4 +1,5 @@
-from typing import List, Tuple
+import json
+from typing import List, Tuple, Optional
 
 
 def validate_vectors(vectors, expected_dim):
@@ -76,5 +77,47 @@ def load_vectors_with_ids_from_csv(csv_path: str) -> List[Tuple[int, List[float]
 
     if not vectors:
         raise ValueError("No valid vectors found in file.")
+
+    return vectors
+
+
+def load_vectors_with_ids_and_tags_from_csv(csv_path: str) -> List[Tuple[int, List[float], Optional[dict]]]:
+    """
+    Load vectors with per-row tags from a CSV file.
+
+    CSV formats accepted:
+      id,val1 val2 val3...
+      id,val1 val2 val3...,{"source":"web"}
+
+    If no 3rd column, tags is None.
+    Returns:
+        List of (id, vector, tags_or_None) tuples
+    """
+    import csv as csv_mod
+    vectors = []
+
+    with open(csv_path, "r", newline="") as f:
+        reader = csv_mod.reader(f)
+        for row in reader:
+            if not row or not row[0].strip():
+                continue
+            try:
+                vec_id = int(row[0])
+            except (ValueError, IndexError):
+                continue
+            if len(row) < 2:
+                continue
+            vec = [float(x) for x in row[1].strip().split() if x]
+            if not vec:
+                continue
+            tags = None
+            if len(row) > 2 and row[2].strip():
+                try:
+                    tags = json.loads(row[2])
+                    if not isinstance(tags, dict):
+                        tags = None
+                except (json.JSONDecodeError, ValueError):
+                    tags = None
+            vectors.append((vec_id, vec, tags))
 
     return vectors

@@ -324,6 +324,7 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
 
     original_ids = []
     vectors = []
+    per_vector_tags = []
     features = None
 
     start = time.time()
@@ -351,6 +352,16 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
                     features = len(vec)
                 original_ids.append(vec_id)
                 vectors.append(vec)
+
+                tags = None
+                if len(row) > 2 and row[2].strip():
+                    try:
+                        tags = json.loads(row[2]) if isinstance(row[2], str) else row[2]
+                        if not isinstance(tags, dict):
+                            tags = None
+                    except (json.JSONDecodeError, ValueError):
+                        tags = None
+                per_vector_tags.append(tags)
         except Exception as e:
             print(f"Error reading file {key}: {e}")
 
@@ -363,6 +374,12 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
     next_available_id = get_next_available_id_atomic(bucket, dataset, len(original_ids))
     new_ids = list(range(next_available_id, next_available_id + len(original_ids)))
     print(f"Reassigning IDs: {len(original_ids)} vectors from IDs {min(original_ids)}-{max(original_ids)} to {next_available_id}-{next_available_id + len(new_ids) - 1}")
+
+    tags_dict = {}
+    for i, nid in enumerate(new_ids):
+        t = per_vector_tags[i] if i < len(per_vector_tags) else None
+        if t:
+            tags_dict[str(nid)] = t
 
     start = time.time()
     k = max(1, min(4096, len(vectors) // 4))
@@ -383,6 +400,17 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
         bucket,
         f"indexes/{dataset}/{INDEX_IMPLEMENTATION}/centroid_{centroid_id}.ann"
     )
+
+    if tags_dict:
+        tags_body = json.dumps(tags_dict).encode("utf-8")
+        s3.put_object(
+            Bucket=bucket,
+            Key=f"indexes/{dataset}/{INDEX_IMPLEMENTATION}/centroid_{centroid_id}_tags.json",
+            Body=tags_body,
+            ContentType="application/json"
+        )
+        print(f"Stored tags for centroid {centroid_id}: {len(tags_dict)} vectors tagged")
+
     store_time = time.time() - start
     print(f"Stored index at indexes/{dataset}/{INDEX_IMPLEMENTATION}/centroid_{centroid_id}.ann in {store_time:.2f}s")
 
