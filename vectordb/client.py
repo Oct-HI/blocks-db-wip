@@ -548,7 +548,7 @@ class VectorDBClient:
             for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
-                    if not key.endswith("_tags.json"):
+                    if not key.endswith("_tags.json") or key.endswith("_reverse_tags.json"):
                         continue
                     try:
                         raw = s3.get_object(Bucket=self.bucket, Key=key)["Body"].read().decode()
@@ -590,7 +590,7 @@ class VectorDBClient:
 
         print(f"Deleted {deleted_count} config(s) for dataset '{dataset_name}'")
     
-    def query(self, dataset_name: str, vector: List[float], k: int = None, hybrid: bool = True, batch_size: int = None, filter_tags: dict = None):
+    def query(self, dataset_name: str, vector: List[float], k: int = None, hybrid: bool = True, batch_size: int = None, filter_tags: dict = None, filter_mode: str = "post"):
         """
         Query a single vector. Always searches everything (indexed + pending).
         
@@ -605,10 +605,10 @@ class VectorDBClient:
         Returns:
             List of (id, distance) tuples sorted by distance
         """
-        results, times = self.query_batch(dataset_name, [vector], k=k, hybrid=hybrid, batch_size=batch_size, filter_tags=filter_tags)
+        results, times = self.query_batch(dataset_name, [vector], k=k, hybrid=hybrid, batch_size=batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
         return results[0], times
 
-    def query_batch(self, dataset_name: str, vectors: List[List[float]], k: int = None, hybrid: bool = True, batch_size: int = None, filter_tags: dict = None):
+    def query_batch(self, dataset_name: str, vectors: List[List[float]], k: int = None, hybrid: bool = True, batch_size: int = None, filter_tags: dict = None, filter_mode: str = "post"):
         """
         Query multiple vectors. Always searches everything (indexed + pending) by default.
         
@@ -630,11 +630,11 @@ class VectorDBClient:
         vectors_np = np.array(vectors)
         
         if hybrid:
-            return self._query_hybrid(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
+            return self._query_hybrid(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
         else:
-            return self._query_indexed_only(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
+            return self._query_indexed_only(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
     
-    def query_indexed_only(self, dataset_name: str, vector: List[float] = None, vectors: List[List[float]] = None, k: int = None, batch_size: int = None, filter_tags: dict = None):
+    def query_indexed_only(self, dataset_name: str, vector: List[float] = None, vectors: List[List[float]] = None, k: int = None, batch_size: int = None, filter_tags: dict = None, filter_mode: str = "post"):
         """
         Query only the indexed vectors (no pending).
         
@@ -656,7 +656,7 @@ class VectorDBClient:
         else:
             raise ValueError("Provide either vector or vectors")
         
-        return self._query_indexed_only(dataset_name, np.array(vecs), k, batch_size=batch_size, filter_tags=filter_tags)
+        return self._query_indexed_only(dataset_name, np.array(vecs), k, batch_size=batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
 
     def _vector_tags_match(self, vector_tags: dict, filter_tags: dict) -> bool:
         if not filter_tags:
@@ -689,12 +689,12 @@ class VectorDBClient:
             filtered.append(qf)
         return filtered
 
-    def _query_indexed_only(self, dataset_name: str, vectors_np: np.ndarray, k: int = None, batch_size: int = None, filter_tags: dict = None):
+    def _query_indexed_only(self, dataset_name: str, vectors_np: np.ndarray, k: int = None, batch_size: int = None, filter_tags: dict = None, filter_mode: str = "post"):
         """Query only the FAISS index (no pending vectors)."""
         k = k if k is not None else self._get_k_result(dataset_name)
         
         try:
-            sv_vectordb = self._load_default_index(dataset_name, batch_size=batch_size, filter_tags=filter_tags)
+            sv_vectordb = self._load_default_index(dataset_name, batch_size=batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
             neighbours, times = sv_vectordb.search(0, vectors_np, filter_tags=filter_tags)
             if not neighbours:
                 neighbours = [[] for _ in range(len(vectors_np))]
@@ -705,12 +705,12 @@ class VectorDBClient:
         
         return neighbours, times
 
-    def _query_hybrid(self, dataset_name: str, vectors_np: np.ndarray, k: int = None, batch_size: int = None, filter_tags: dict = None):
+    def _query_hybrid(self, dataset_name: str, vectors_np: np.ndarray, k: int = None, batch_size: int = None, filter_tags: dict = None, filter_mode: str = "post"):
         """Internal hybrid query implementation."""
         k = k if k is not None else self._get_k_result(dataset_name)
 
         try:
-            sv_vectordb = self._load_default_index(dataset_name, batch_size=batch_size, filter_tags=filter_tags)
+            sv_vectordb = self._load_default_index(dataset_name, batch_size=batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
             results, times = sv_vectordb.search(0, vectors_np, filter_tags=filter_tags)
         except ValueError:
             results = None
@@ -735,7 +735,7 @@ class VectorDBClient:
 
         return results, times
     
-    def query_from_file(self, dataset_name: str, csv_path: str, hybrid: bool = True, k: int = None, batch_size: int = None, filter_tags: dict = None):
+    def query_from_file(self, dataset_name: str, csv_path: str, hybrid: bool = True, k: int = None, batch_size: int = None, filter_tags: dict = None, filter_mode: str = "post"):
         """
         Query ALL vectors from a CSV file. Always searches everything by default.
         
@@ -770,11 +770,11 @@ class VectorDBClient:
         vectors_np = np.array(vectors)
         
         if hybrid:
-            return self._query_hybrid(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
+            return self._query_hybrid(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
         else:
-            return self._query_indexed_only(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags)
+            return self._query_indexed_only(dataset_name, vectors_np, k, batch_size=batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
 
-    def query_hybrid(self, dataset_name: str, vectors: List[List[float]], k: int = None, batch_size: int = None, filter_tags: dict = None):
+    def query_hybrid(self, dataset_name: str, vectors: List[List[float]], k: int = None, batch_size: int = None, filter_tags: dict = None, filter_mode: str = "post"):
         """
         Explicit hybrid query - searches both indexed and pending vectors.
         Alias for query_batch with hybrid=True.
@@ -789,7 +789,7 @@ class VectorDBClient:
         Returns:
             Merged search results with (id, distance) tuples
         """
-        return self.query_batch(dataset_name, vectors, k=k, hybrid=True, batch_size=batch_size, filter_tags=filter_tags)
+        return self.query_batch(dataset_name, vectors, k=k, hybrid=True, batch_size=batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
 
     def _get_k_result(self, dataset_name: str) -> int:
         """Get k_result from index config."""
@@ -814,7 +814,7 @@ class VectorDBClient:
         implementation, num_index = indexes[0]
         return load_index_config(self.bucket, dataset_name, implementation, num_index)
     
-    def _load_default_index(self, dataset_name: str, batch_size: int = None, filter_tags: dict = None):
+    def _load_default_index(self, dataset_name: str, batch_size: int = None, filter_tags: dict = None, filter_mode: str = "post"):
         """
         Load the only stored index config for a dataset.
         Raises error if none or more than one exist.
@@ -849,5 +849,6 @@ class VectorDBClient:
             config["query_batch_size"] = batch_size
         if filter_tags is not None:
             config["filter_tags"] = filter_tags
+        config["filter_mode"] = filter_mode
 
         return ServerlessVectorDB(**config)

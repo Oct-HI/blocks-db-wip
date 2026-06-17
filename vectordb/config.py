@@ -71,7 +71,10 @@ class SvlessVectorDBParams:
     filter_tags: dict = None
 
     # Post-filter overfetch multiplier (k * overfetch candidates before tag filter)
-    post_filter_overfetch: int = 3
+    post_filter_overfetch: int = 2
+
+    # Tag filter mode: 'post' (overfetch + loop) or 'pre' (reverse-index + IDSelectorBatch)
+    filter_mode: str = "post"
 
     # DynamoDB connection info (injected at query time)
     dynamodb_region: str = None

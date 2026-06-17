@@ -94,6 +94,10 @@ def main():
     query_parser.add_argument("--indexed-only", action="store_true", help="Search only indexed vectors (skip pending)")
     query_parser.add_argument("--batch-size", type=int, default=None, help="Override query_batch_size (centroid .ann per map worker)")
     query_parser.add_argument("--filter", type=str, default=None, help='JSON dict of tag filters (e.g. \'{"source":"web"}\'), AND semantics, only centroids/pending matching ALL tags are searched')
+    query_parser.add_argument(
+        "--filter-mode", default=None, choices=["post", "pre"],
+        help="Tag filter mode: post (default, overfetch + loop) or pre (reverse-index + IDSelector)"
+    )
 
     # ── get-by-tags ────────────────────────────────────────────
     get_tags_parser = subparsers.add_parser("get-by-tags", help="Get vector IDs matching tags")
@@ -348,18 +352,21 @@ def main():
 
         hybrid = not args.indexed_only
         filter_tags = json.loads(args.filter) if args.filter else None
+        filter_mode = args.filter_mode or "post"
         if filter_tags:
             print(f"Filter tags: {filter_tags}")
+        if filter_mode != "post":
+            print(f"Filter mode: {filter_mode}")
 
         if args.vector:
             vector = [float(x) for x in args.vector.split()]
-            results, times = client.query(args.name, vector, k=args.k, hybrid=hybrid, batch_size=args.batch_size, filter_tags=filter_tags)
+            results, times = client.query(args.name, vector, k=args.k, hybrid=hybrid, batch_size=args.batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
             print(f"Query: {vector[:5]}...")
             print(f"Results: {[_fmt_result(r) for r in results[:args.k]]}")
         elif args.file:
             if not os.path.exists(args.file):
                 raise FileNotFoundError(args.file)
-            results, times = client.query_from_file(args.name, args.file, hybrid=hybrid, k=args.k, batch_size=args.batch_size, filter_tags=filter_tags)
+            results, times = client.query_from_file(args.name, args.file, hybrid=hybrid, k=args.k, batch_size=args.batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
             print(f"Results ({len(results)} queries):")
             for i, res in enumerate(results[:5]):
                 print(f"  Query {i}: {[_fmt_result(r) for r in res[:args.k]]}")
@@ -371,6 +378,8 @@ def main():
         print(f"\nSearch mode: {'hybrid (indexed + pending)' if hybrid else 'indexed only'}")
         if filter_tags:
             print(f"Filter tags: {filter_tags}")
+        if filter_mode != "post":
+            print(f"Filter mode: {filter_mode}")
         if "error" not in times:
             print(f"Query times: {json.dumps(times, indent=2)}")
 
@@ -394,7 +403,7 @@ def main():
             for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
-                    if not key.endswith("_tags.json"):
+                    if not key.endswith("_tags.json") or key.endswith("_reverse_tags.json"):
                         continue
                     try:
                         raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode()

@@ -411,6 +411,17 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
         )
         print(f"Stored tags for centroid {centroid_id}: {len(tags_dict)} vectors tagged")
 
+        reverse = {}
+        for vid_str, vt in tags_dict.items():
+            for k, v in vt.items():
+                reverse.setdefault(f"{k}:{v}", []).append(int(vid_str))
+        s3.put_object(
+            Bucket=bucket,
+            Key=f"indexes/{dataset}/{INDEX_IMPLEMENTATION}/centroid_{centroid_id}_reverse_tags.json",
+            Body=json.dumps(reverse).encode("utf-8"),
+            ContentType="application/json"
+        )
+
     store_time = time.time() - start
     print(f"Stored index at indexes/{dataset}/{INDEX_IMPLEMENTATION}/centroid_{centroid_id}.ann in {store_time:.2f}s")
 

@@ -185,7 +185,7 @@ def _search_indexed(task_spec, k, storage, config, start, source="indexed"):
 
     filter_tags = getattr(config, 'filter_tags', None)
     overfetch = getattr(config, 'post_filter_overfetch', 3)
-    search_k = k * overfetch if filter_tags else k
+    filter_mode = getattr(config, 'filter_mode', 'post')
 
     res_queries = defaultdict(list)
 
@@ -194,6 +194,7 @@ def _search_indexed(task_spec, k, storage, config, start, source="indexed"):
         index = faiss.read_index(f'/tmp/index_{file_idx}.ann')
 
         centroid_tags = {}
+        reverse_data = None
         if filter_tags:
             cid = queries_key[1][file_idx] if file_idx < len(queries_key[1]) else None
             if cid is not None:
@@ -206,22 +207,48 @@ def _search_indexed(task_spec, k, storage, config, start, source="indexed"):
                 except Exception:
                     pass
 
-        d, i = index.search(np.array(queries), search_k)
-        for x in range(len(queries)):
-            if filter_tags and centroid_tags:
-                fd, fi = [], []
-                for dist, idx in zip(d[x], i[x]):
-                    vt = centroid_tags.get(str(int(idx)))
-                    if vt is not None:
-                        if all(vt.get(tk) == tv for tk, tv in filter_tags.items()):
+                if filter_mode == 'pre':
+                    reverse_key = tags_key.replace('_tags.json', '_reverse_tags.json')
+                    try:
+                        raw = storage.get_object(bucket=config.storage_bucket, key=reverse_key)
+                        if isinstance(raw, bytes):
+                            raw = raw.decode()
+                        reverse_data = json.loads(raw)
+                    except Exception:
+                        pass
+
+        if filter_mode == 'pre' and filter_tags and reverse_data:
+            matching_ids = None
+            for fk, fv in filter_tags.items():
+                ids = set(reverse_data.get(f"{fk}:{fv}", []))
+                matching_ids = ids if matching_ids is None else matching_ids & ids
+            if matching_ids:
+                sel = faiss.IDSelectorBatch(list(matching_ids))
+                d, i = index.search(np.array(queries), k,
+                                    params=faiss.SearchParametersIVF(sel=sel))
+                for x in range(len(queries)):
+                    res_queries[x].append([d[x].tolist(), i[x].tolist()])
+            else:
+                for x in range(len(queries)):
+                    res_queries[x].append([[], []])
+        else:
+            search_k = k * overfetch if filter_tags else k
+            d, i = index.search(np.array(queries), search_k)
+            for x in range(len(queries)):
+                if filter_tags and centroid_tags:
+                    fd, fi = [], []
+                    for dist, idx in zip(d[x], i[x]):
+                        vt = centroid_tags.get(str(int(idx)))
+                        if vt is not None:
+                            if all(vt.get(tk) == tv for tk, tv in filter_tags.items()):
+                                fd.append(float(dist))
+                                fi.append(int(idx))
+                        elif not centroid_tags:
                             fd.append(float(dist))
                             fi.append(int(idx))
-                    elif not centroid_tags:
-                        fd.append(float(dist))
-                        fi.append(int(idx))
-                res_queries[x].append([fd, fi])
-            else:
-                res_queries[x].append([d[x].tolist(), i[x].tolist()])
+                    res_queries[x].append([fd, fi])
+                else:
+                    res_queries[x].append([d[x].tolist(), i[x].tolist()])
         os.remove(f'/tmp/index_{file_idx}.ann')
 
     final_results = {}

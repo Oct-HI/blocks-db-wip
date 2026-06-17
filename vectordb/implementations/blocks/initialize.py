@@ -41,6 +41,17 @@ def generate_index_blocks(id, obj, params, n_blocks, storage: Storage):
                 json.dumps(tags_dict).encode("utf-8")
             )
 
+            reverse = {}
+            for vid_str, vt in tags_dict.items():
+                for k, v in vt.items():
+                    reverse.setdefault(f"{k}:{v}", []).append(int(vid_str))
+            reverse_key = f"indexes/{params.dataset}/{params.implementation}/centroid_{key_id}_reverse_tags.json"
+            storage.put_object(
+                params.storage_bucket,
+                reverse_key,
+                json.dumps(reverse).encode("utf-8")
+            )
+
         key_id += 1
 
     return time.time() - start
