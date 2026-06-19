@@ -265,6 +265,52 @@ class VectorIndexTracker:
             self.s3.delete_objects(Bucket=self.bucket, Delete={"Objects": objects})
         self.clear_pending_file_tracking(dataset_name)
 
+    def _delete_ddb_dataset_items(self, dataset_name: str):
+        """Delete all DynamoDB items belonging to a dataset."""
+        try:
+            self.table.delete_item(
+                Key={"centroid_id": f"{dataset_name}_CONFIG", "sk": "META"}
+            )
+        except:
+            pass
+
+        try:
+            self.table.delete_item(
+                Key={"centroid_id": f"{dataset_name}_ID_TRACKER", "sk": "META"}
+            )
+        except:
+            pass
+
+        try:
+            response = self.table.query(
+                KeyConditionExpression=(
+                    boto3.dynamodb.conditions.Key('centroid_id').eq(f"DATASET#{dataset_name}")
+                )
+            )
+            for item in response.get("Items", []):
+                try:
+                    self.table.delete_item(
+                        Key={"centroid_id": item["centroid_id"], "sk": item["sk"]}
+                    )
+                except:
+                    pass
+        except:
+            pass
+
+        try:
+            response = self.table.query(
+                KeyConditionExpression=boto3.dynamodb.conditions.Key('centroid_id').begins_with(f"{dataset_name}#")
+            )
+            for item in response.get("Items", []):
+                try:
+                    self.table.delete_item(
+                        Key={"centroid_id": item["centroid_id"], "sk": item["sk"]}
+                    )
+                except:
+                    pass
+        except:
+            pass
+
     def delete_tracking(self, dataset_name: str):
         files = self.get_pending_files(dataset_name)
         if files:
@@ -278,3 +324,4 @@ class VectorIndexTracker:
             self.s3.delete_object(Bucket=self.bucket, Key=indexed_files_key)
         except:
             pass
+        self._delete_ddb_dataset_items(dataset_name)

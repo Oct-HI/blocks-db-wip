@@ -106,6 +106,11 @@ def main():
     get_tags_parser.add_argument("--filter", required=True, type=str, help='JSON dict of tag filters (e.g. \'{"source":"web"}\')')
     get_tags_parser.add_argument("--limit", type=int, default=100, help="Max IDs to return (default: 100)")
 
+    # ── delete-dataset ────────────────────────────────────────
+    del_parser = subparsers.add_parser("delete-dataset", help="Delete dataset and all its data")
+    del_parser.add_argument("name", help="Dataset name")
+    del_parser.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+
     # ── status ────────────────────────────────────────────────
     status_parser = subparsers.add_parser("status", help="Show dataset status")
     status_parser.add_argument("name", help="Dataset name")
@@ -123,7 +128,7 @@ def main():
     VISIBLE_COMMANDS = {
         "setup", "configure", "refresh-credentials", "update-threshold",
         "initialize-database", "put", "query", "status", "get",
-        "get-by-tags", "deploy-lambda"
+        "get-by-tags", "deploy-lambda", "delete-dataset"
     }
 
     if not args.command:
@@ -424,6 +429,15 @@ def main():
                 print(f"  {vid}")
         else:
             print("No matching vectors found.")
+
+    # ── delete-dataset ────────────────────────────────────────
+    elif args.command == "delete-dataset":
+        if not args.yes:
+            confirm = input(f"Delete dataset '{args.name}' and ALL its data? [y/N] ")
+            if confirm.lower() != "y":
+                print("Aborted.")
+                return
+        client.delete_dataset(args.name)
 
     # ── status ────────────────────────────────────────────────
     elif args.command == "status":

@@ -325,6 +325,7 @@ blocks-db status mydataset -v
 | `status` | Show dataset status and index info | `blocks-db status <name> [-v]` |
 | `get` | Retrieve vectors by ID, list vectors, or show pending | `blocks-db get <n> <id>... [--limit N] [--pending]` |
 | `get-by-tags` | List vector IDs matching tags | `blocks-db get-by-tags <n> --filter <json> [--limit N]` |
+| `delete-dataset` | Delete dataset and all its data | `blocks-db delete-dataset <n> [--yes]` |
 
 ### `get` command usage
 
@@ -398,6 +399,8 @@ client = VectorDBClient(bucket="your-bucket", region="us-east-1")
 vector = [0.1, 0.2, ...]
 results, times = client.query("mydataset", vector)
 ```
+
+> 📖 Full API reference: [docs/python-client.md](docs/python-client.md)
 
 ---
 

@@ -83,6 +83,7 @@ from .utils.s3_utils import is_s3express_bucket
 class VectorDBClient:
 
     def __init__(self, bucket: str, region: str = None, sqs_queue_url: str = None):
+        """Initialize client with S3 bucket, optional region and SQS queue URL."""
         self.bucket = bucket
         self.sqs_queue_url = sqs_queue_url
 
@@ -107,6 +108,7 @@ class VectorDBClient:
         print(f"Dataset '{name}' created successfully.")
 
     def delete_dataset(self, name: str):
+        """Delete a dataset and all its data from S3 and DynamoDB."""
         delete_dataset(self.bucket, name)
         self.tracker.delete_tracking(name)
         print(f"Dataset '{name}' deleted.")
@@ -159,6 +161,7 @@ class VectorDBClient:
         self.tracker.mark_vectors_indexed(dataset_name, indexed_ids)
 
     def refresh_credentials(self):
+        """Refresh AWS credentials in Lithops config from ~/.aws/credentials."""
         return refresh_lithops_credentials()
 
     def list_datasets(self):
@@ -183,12 +186,15 @@ class VectorDBClient:
         return datasets
 
     def get_vectors(self, dataset_name: str, ids):
+        """Get vectors by their IDs from the dataset."""
         return get_vectors_by_id(self.bucket, dataset_name, ids)
 
     def list_vectors(self, dataset_name: str, limit: int = 100):
+        """List first N vectors from the dataset."""
         return list_vectors(self.bucket, dataset_name, limit)
 
     def list_vectors_paginated(self, dataset_name: str, start=0, limit=100):
+        """List vectors with pagination (start offset, limit)."""
         return list_vectors_paginated(
             self.bucket,
             dataset_name,
@@ -197,6 +203,7 @@ class VectorDBClient:
         )
     
     def list_indexes(self, dataset_name: str):
+        """List available index configs for a dataset."""
         return list_indexes(self.bucket, dataset_name)
     
     def index_dataset(self, dataset_name: str, config: dict, num_workers: int = 16, save_config: bool = True, track_indexed: bool = True, setup_auto_indexer: bool = True, csv_blocks: tuple = None):
