@@ -11,6 +11,7 @@ from .client import VectorDBClient, build_csv_blocks_from_local
 from .infra import run_setup, refresh_lithops_credentials, get_infra_config
 from .config import DEFAULT_INFRA_CONFIG
 from .utils.s3_utils import is_s3express_bucket, parse_express_az
+from .utils.vector_utils import load_vectors_with_ids_from_csv, load_vectors_with_ids_and_tags_from_csv, load_vectors_from_csv
 
 
 CONFIG_DIR = Path.home() / ".blocks-db-config"
@@ -169,7 +170,7 @@ def main():
         if args.role_name:
             overrides["lambda_role_name"] = args.role_name
         if args.threshold:
-            overrides["threshold_size_mb"] = args.threshold
+            overrides["threshold_size_bytes"] = args.threshold
         use_s3express = args.s3express or is_s3express_bucket(args.bucket)
         use_sqs = args.sqs or use_s3express
         if use_s3express:
@@ -286,8 +287,6 @@ def main():
 
     # ── put ───────────────────────────────────────────────────
     elif args.command == "put":
-        from .utils.vector_utils import load_vectors_with_ids_from_csv, load_vectors_with_ids_and_tags_from_csv, load_vectors_from_csv
-
         tags = json.loads(args.tags) if args.tags else None
         if tags:
             print(f"Batch tags: {tags}")

@@ -28,8 +28,8 @@ from botocore.exceptions import ClientError
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 
-DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "__DYNAMODB_TABLE__")
-DEFAULT_THRESHOLD_BYTES = int(os.environ.get("THRESHOLD_SIZE_BYTES", "__THRESHOLD_SIZE__"))
+DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "BlocksDB-default")
+DEFAULT_THRESHOLD_BYTES = int(os.environ.get("THRESHOLD_SIZE_BYTES", "33554432"))
 INDEX_IMPLEMENTATION = os.environ.get("INDEX_IMPLEMENTATION", "blocks")
 BYTES_PER_VECTOR = 8 + 96 * 8
 
