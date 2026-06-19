@@ -43,8 +43,8 @@ def _get_matching_centroids(table, dataset, num_index, filter_tags):
     """Query DynamoDB for centroids whose aggregated tags match the filter.
     Returns list of centroid IDs (ints) that match.
 
-    Centroids without a DDB tag record are always included (backward compat
-    for datasets with no tags). Centroids with a DDB record are filtered.
+    Centroids without a DDB tag record are excluded (they have no tags, so
+    they cannot match any filter). Centroids with a DDB record are filtered.
     """
     if not filter_tags:
         return list(range(num_index))
@@ -70,11 +70,10 @@ def _get_matching_centroids(table, dataset, num_index, filter_tags):
     matching = []
     for cid in range(num_index):
         if cid not in centroids_with_ddb:
+            continue
+        tags = centroids_with_ddb[cid]
+        if not tags or _centroid_tags_match(tags, filter_tags):
             matching.append(cid)
-        else:
-            tags = centroids_with_ddb[cid]
-            if not tags or _centroid_tags_match(tags, filter_tags):
-                matching.append(cid)
 
     return matching
 

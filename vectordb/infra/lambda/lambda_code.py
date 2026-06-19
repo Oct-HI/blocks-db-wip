@@ -431,7 +431,21 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
 
     update_config_num_index(bucket, dataset, centroid_id + 1)
 
-    save_centroid_tags(centroid_id, dataset, files, table)
+    aggregated = {}
+    for vid_str, vt in tags_dict.items():
+        for k, v in vt.items():
+            aggregated.setdefault(k, set()).add(v)
+    if aggregated:
+        tags_map = {k: sorted(v) for k, v in aggregated.items()}
+        try:
+            table.put_item(Item={
+                "centroid_id": f"DATASET#{dataset}",
+                "sk": f"CENTROID#{centroid_id}#META",
+                "tags": tags_map
+            })
+            print(f"Saved centroid DDB tags for {dataset}/{centroid_id}: {tags_map}")
+        except Exception as e:
+            print(f"Error saving centroid DDB tags: {e}")
 
 
 def save_centroid_tags(centroid_id: int, dataset: str, files: List[Dict], table):

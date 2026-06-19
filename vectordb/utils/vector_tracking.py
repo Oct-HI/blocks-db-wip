@@ -217,8 +217,8 @@ class VectorIndexTracker:
                     line = raw_line.decode()
                     if line.startswith("id,"):
                         continue
-                    parts = line.split(",", 1)
-                    if len(parts) == 2:
+                    parts = line.split(",", 2)
+                    if len(parts) >= 2:
                         try:
                             vec_id = int(parts[0])
                             vec = [float(x) for x in parts[1].strip().split() if x]
