@@ -1,6 +1,21 @@
 # vectordb — Blocks-DB Python Package
 
-Top-level modules:
+## Data Flow
+
+```
+CLI (cli.py)
+  └─ VectorDBClient (client.py)
+       └─ ServerlessVectorDB (serverless_vectordb.py)
+            ├─ Indexing: indexator.py (Lithops map/reduce on centroids)
+            └─ Search:   Orchestrator (Lithops map/reduce)
+```
+
+`cli.py` parses CLI args and delegates to `VectorDBClient`.
+`client.py` manages datasets (put, status, delete) and wraps both indexing (`index_dataset`) and search (`query`).
+`serverless_vectordb.py` bridges client calls to the Lithops `FunctionExecutor` — it handles serialization, function dispatch, and result collection.
+`indexing/indexator.py` and `orchestration/orchestrator.py` contain the actual map/reduce logic.
+
+## Top-Level Modules
 
 | File | Description |
 |------|-------------|
@@ -10,7 +25,7 @@ Top-level modules:
 | `serverless_vectordb.py` | `ServerlessVectorDB` — Lithops-based index/search wrapper |
 | `benchmarks.py` | Recall calculation helpers |
 
-Submodules:
+## Submodules
 
 | Directory | Description |
 |-----------|-------------|

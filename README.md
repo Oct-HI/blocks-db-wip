@@ -46,6 +46,32 @@ pip install .
 
 ---
 
+## 🚀 Quickstart (minimal workflow)
+
+```bash
+# 1. Save default bucket and region
+blocks-db configure --bucket my-bucket --region us-east-1
+
+# 2. Create AWS infrastructure (Lambda, DynamoDB, ECR, S3 triggers)
+blocks-db setup --bucket my-bucket
+
+# 3. Index a dataset (needs an index config JSON — see below)
+blocks-db initialize-database my-dataset vectors.csv --config config.json
+
+# 4. Add more vectors incrementally
+blocks-db put my-dataset new_vectors.csv
+
+# 5. Search (hybrid: index + pending by default)
+blocks-db query my-dataset --file queries.csv --k 10
+
+# 6. Check status
+blocks-db status my-dataset -v
+```
+
+Each command is explained in detail below.
+
+---
+
 ## ⚙️ Initial Setup
 
 ### 1. Configure AWS credentials
@@ -438,7 +464,15 @@ vectordb/
 └── utils/              # S3, DynamoDB, CSV, hybrid search, tracking utilities
 ```
 
-Each subdirectory contains a README.md detailing its files.
+Each subdirectory contains a README.md detailing its files:
+
+| Directory | README |
+|-----------|--------|
+| `config/` | [`vectordb/config/README.md`](vectordb/config/README.md) |
+| `core/` | [`vectordb/core/README.md`](vectordb/core/README.md) |
+| `indexing/` | [`vectordb/indexing/README.md`](vectordb/indexing/README.md) |
+| `orchestration/` | [`vectordb/orchestration/README.md`](vectordb/orchestration/README.md) |
+| `utils/` | [`vectordb/utils/README.md`](vectordb/utils/README.md) |
 
 ### Blocks & Concepts
 
