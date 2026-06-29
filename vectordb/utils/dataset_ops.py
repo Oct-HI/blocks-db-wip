@@ -51,6 +51,7 @@ def upload_dataset(bucket, dataset_name, csv_path):
 def delete_dataset(bucket, dataset_name):
     main_key = f"datasets/{dataset_name}/source.csv"
     true_key = f"true_neighbours_{dataset_name}.csv"
+    csv_blocks_key = f"tracking/csv_blocks_{dataset_name}.json"
 
     try:
         s3.delete_object(Bucket=bucket, Key=main_key)
@@ -62,8 +63,24 @@ def delete_dataset(bucket, dataset_name):
     except:
         pass
 
-    from .index_ops import delete_indexes
+    try:
+        s3.delete_object(Bucket=bucket, Key=csv_blocks_key)
+    except:
+        pass
+
+    processed_prefix = f"processed/{dataset_name}/"
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=processed_prefix):
+            if "Contents" in page:
+                objects = [{"Key": obj["Key"]} for obj in page["Contents"]]
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+    except:
+        pass
+
+    from .index_ops import delete_indexes, delete_index_configs
     delete_indexes(bucket, dataset_name)
+    delete_index_configs(bucket, dataset_name)
 
     print(f"Dataset {dataset_name} and its indexes deleted.")
 

@@ -11,6 +11,7 @@ from .client import VectorDBClient, build_csv_blocks_from_local
 from .infra import run_setup, refresh_lithops_credentials, get_infra_config
 from .config import DEFAULT_INFRA_CONFIG
 from .utils.s3_utils import is_s3express_bucket, parse_express_az
+from .utils.vector_utils import load_vectors_with_ids_from_csv, load_vectors_with_ids_and_tags_from_csv, load_vectors_from_csv
 
 
 CONFIG_DIR = Path.home() / ".blocks-db-config"
@@ -80,7 +81,7 @@ def main():
     # ── put ───────────────────────────────────────────────────
     put_parser = subparsers.add_parser("put", help="Add new vectors (stored as individual files)")
     put_parser.add_argument("name", help="Dataset name")
-    put_parser.add_argument("csv_path", help="CSV file with vectors (id, vector values)")
+    put_parser.add_argument("csv_path", help="CSV file with vectors (id, vector values, optional 3rd col: JSON tags)")
     put_parser.add_argument("--single", action="store_true", help="Treat as single vector per file (one vector per file)")
     put_parser.add_argument("--tags", type=str, default=None, help='JSON dict of tags (e.g. \'{"source":"web","category":"news"}\')')
 
@@ -94,6 +95,21 @@ def main():
     query_parser.add_argument("--indexed-only", action="store_true", help="Search only indexed vectors (skip pending)")
     query_parser.add_argument("--batch-size", type=int, default=None, help="Override query_batch_size (centroid .ann per map worker)")
     query_parser.add_argument("--filter", type=str, default=None, help='JSON dict of tag filters (e.g. \'{"source":"web"}\'), AND semantics, only centroids/pending matching ALL tags are searched')
+    query_parser.add_argument(
+        "--filter-mode", default=None, choices=["post", "pre"],
+        help="Tag filter mode: post (default, overfetch + loop) or pre (reverse-index + IDSelector)"
+    )
+
+    # ── get-by-tags ────────────────────────────────────────────
+    get_tags_parser = subparsers.add_parser("get-by-tags", help="Get vector IDs matching tags")
+    get_tags_parser.add_argument("name", help="Dataset name")
+    get_tags_parser.add_argument("--filter", required=True, type=str, help='JSON dict of tag filters (e.g. \'{"source":"web"}\')')
+    get_tags_parser.add_argument("--limit", type=int, default=100, help="Max IDs to return (default: 100)")
+
+    # ── delete-dataset ────────────────────────────────────────
+    del_parser = subparsers.add_parser("delete-dataset", help="Delete dataset and all its data")
+    del_parser.add_argument("name", help="Dataset name")
+    del_parser.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
 
     # ── status ────────────────────────────────────────────────
     status_parser = subparsers.add_parser("status", help="Show dataset status")
@@ -112,7 +128,7 @@ def main():
     VISIBLE_COMMANDS = {
         "setup", "configure", "refresh-credentials", "update-threshold",
         "initialize-database", "put", "query", "status", "get",
-        "deploy-lambda"
+        "get-by-tags", "deploy-lambda", "delete-dataset"
     }
 
     if not args.command:
@@ -159,7 +175,7 @@ def main():
         if args.role_name:
             overrides["lambda_role_name"] = args.role_name
         if args.threshold:
-            overrides["threshold_size_mb"] = args.threshold
+            overrides["threshold_size_bytes"] = args.threshold
         use_s3express = args.s3express or is_s3express_bucket(args.bucket)
         use_sqs = args.sqs or use_s3express
         if use_s3express:
@@ -276,11 +292,9 @@ def main():
 
     # ── put ───────────────────────────────────────────────────
     elif args.command == "put":
-        from .utils.vector_utils import load_vectors_with_ids_from_csv, load_vectors_from_csv
-
         tags = json.loads(args.tags) if args.tags else None
         if tags:
-            print(f"Tags: {tags}")
+            print(f"Batch tags: {tags}")
 
         print(f"\n=== Putting vectors into '{args.name}' ===")
 
@@ -293,23 +307,45 @@ def main():
                     try:
                         vec_id = int(row[0])
                         vec = [float(x) for x in row[1].strip().split() if x]
-                        key = client.tracker.put_vector(args.name, vec_id, vec, tags=tags)
+                        pvt = None
+                        if len(row) > 2 and row[2].strip():
+                            try:
+                                pvt = json.loads(row[2])
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+                        key = client.tracker.put_vector(args.name, vec_id, vec, tags=tags, per_vector_tags=pvt)
                         print(f"  Uploaded vector {vec_id} -> {key}")
                     except (ValueError, IndexError) as e:
                         print(f"  Skipping invalid line: {row} ({e})")
         else:
-            vectors = load_vectors_with_ids_from_csv(args.csv_path)
+            has_3rd_col = False
+            with open(args.csv_path, "r", newline="") as f:
+                import csv as csv_mod
+                first = csv_mod.reader(f)
+                for r in first:
+                    if len(r) > 2 and r[2].strip():
+                        has_3rd_col = True
+                    break
+
+            if has_3rd_col:
+                vectors_with_tags = load_vectors_with_ids_and_tags_from_csv(args.csv_path)
+                vectors = [(v[0], v[1]) for v in vectors_with_tags]
+                per_vector_tags = [v[2] for v in vectors_with_tags]
+            else:
+                vectors = load_vectors_with_ids_from_csv(args.csv_path)
+                per_vector_tags = None
 
             if not vectors:
                 print("No vectors found in file.")
                 return
 
             if len(vectors) == 1:
+                pvt = per_vector_tags[0] if per_vector_tags else None
                 vec_id, vec = vectors[0]
-                key = client.tracker.put_vector(args.name, vec_id, vec, tags=tags)
+                key = client.tracker.put_vector(args.name, vec_id, vec, tags=tags, per_vector_tags=pvt)
                 print(f"Uploaded 1 vector -> {key}")
             else:
-                key = client.tracker.put_vectors(args.name, vectors, tags=tags)
+                key = client.tracker.put_vectors(args.name, vectors, tags=tags, per_vector_tags=per_vector_tags)
                 print(f"Uploaded {len(vectors)} vectors -> {key}")
 
         print(f"\nVectors added to pending. Use 'blocks-db query {args.name}' to search them.")
@@ -320,18 +356,21 @@ def main():
 
         hybrid = not args.indexed_only
         filter_tags = json.loads(args.filter) if args.filter else None
+        filter_mode = args.filter_mode or "post"
         if filter_tags:
             print(f"Filter tags: {filter_tags}")
+        if filter_mode != "post":
+            print(f"Filter mode: {filter_mode}")
 
         if args.vector:
             vector = [float(x) for x in args.vector.split()]
-            results, times = client.query(args.name, vector, k=args.k, hybrid=hybrid, batch_size=args.batch_size, filter_tags=filter_tags)
+            results, times = client.query(args.name, vector, k=args.k, hybrid=hybrid, batch_size=args.batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
             print(f"Query: {vector[:5]}...")
             print(f"Results: {[_fmt_result(r) for r in results[:args.k]]}")
         elif args.file:
             if not os.path.exists(args.file):
                 raise FileNotFoundError(args.file)
-            results, times = client.query_from_file(args.name, args.file, hybrid=hybrid, k=args.k, batch_size=args.batch_size, filter_tags=filter_tags)
+            results, times = client.query_from_file(args.name, args.file, hybrid=hybrid, k=args.k, batch_size=args.batch_size, filter_tags=filter_tags, filter_mode=filter_mode)
             print(f"Results ({len(results)} queries):")
             for i, res in enumerate(results[:5]):
                 print(f"  Query {i}: {[_fmt_result(r) for r in res[:args.k]]}")
@@ -343,8 +382,62 @@ def main():
         print(f"\nSearch mode: {'hybrid (indexed + pending)' if hybrid else 'indexed only'}")
         if filter_tags:
             print(f"Filter tags: {filter_tags}")
+        if filter_mode != "post":
+            print(f"Filter mode: {filter_mode}")
         if "error" not in times:
             print(f"Query times: {json.dumps(times, indent=2)}")
+
+    # ── get-by-tags ───────────────────────────────────────────
+    elif args.command == "get-by-tags":
+        import json as _json
+        filter_tags = _json.loads(args.filter) if args.filter else {}
+        if not filter_tags:
+            print("No filter provided.")
+            return
+
+        print(f"\n=== Getting vectors by tags for '{args.name}' ===")
+        print(f"Filter: {filter_tags}")
+
+        s3 = boto3.client("s3")
+        prefix = f"indexes/{args.name}/blocks/"
+        matching_ids = None
+
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if not key.endswith("_tags.json") or key.endswith("_reverse_tags.json"):
+                        continue
+                    try:
+                        raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
+                        tags_data = _json.loads(raw)
+                        for vid_str, vt in tags_data.items():
+                            if all(vt.get(k) == v for k, v in filter_tags.items()):
+                                if matching_ids is None:
+                                    matching_ids = set()
+                                matching_ids.add(int(vid_str))
+                    except Exception as e:
+                        print(f"  Error reading {key}: {e}")
+        except Exception as e:
+            print(f"  Error listing centroids: {e}")
+
+        if matching_ids:
+            sorted_ids = sorted(matching_ids)[:args.limit]
+            print(f"\nFound {len(matching_ids)} matching vectors (showing {len(sorted_ids)}):")
+            for vid in sorted_ids:
+                print(f"  {vid}")
+        else:
+            print("No matching vectors found.")
+
+    # ── delete-dataset ────────────────────────────────────────
+    elif args.command == "delete-dataset":
+        if not args.yes:
+            confirm = input(f"Delete dataset '{args.name}' and ALL its data? [y/N] ")
+            if confirm.lower() != "y":
+                print("Aborted.")
+                return
+        client.delete_dataset(args.name)
 
     # ── status ────────────────────────────────────────────────
     elif args.command == "status":

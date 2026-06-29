@@ -46,6 +46,32 @@ pip install .
 
 ---
 
+## 🚀 Quickstart (minimal workflow)
+
+```bash
+# 1. Save default bucket and region
+blocks-db configure --bucket my-bucket --region us-east-1
+
+# 2. Create AWS infrastructure (Lambda, DynamoDB, ECR, S3 triggers)
+blocks-db setup --bucket my-bucket
+
+# 3. Index a dataset (needs an index config JSON — see below)
+blocks-db initialize-database my-dataset vectors.csv --config config.json
+
+# 4. Add more vectors incrementally
+blocks-db put my-dataset new_vectors.csv
+
+# 5. Search (hybrid: index + pending by default)
+blocks-db query my-dataset --file queries.csv --k 10
+
+# 6. Check status
+blocks-db status my-dataset -v
+```
+
+Each command is explained in detail below.
+
+---
+
 ## ⚙️ Initial Setup
 
 ### 1. Configure AWS credentials
@@ -225,6 +251,19 @@ blocks-db put mydataset new_vectors.csv --tags '{"source":"web","category":"news
 
 Tags are stored per batch and can be used to filter searches later. Each vector in the batch inherits the same tags.
 
+**Per-vector tags (3rd CSV column):**
+
+Alternatively, each row in the CSV can carry its own tags as a JSON third
+column. This is more granular than batch-level `--tags`:
+
+```
+1 0.1 0.2 ... {"source":"web","priority":"high"}
+2 0.4 0.5 ... {"source":"api","priority":"low"}
+```
+
+When `--tags` and per-vector tags are both present, per-vector tags take
+precedence.
+
 **Single-vector mode:**
 ```bash
 blocks-db put mydataset single_vector.csv --single
@@ -263,6 +302,25 @@ blocks-db query mydataset --file queries.csv --indexed-only
 blocks-db query mydataset --file queries.csv --k 10 --filter '{"source":"web"}'
 ```
 
+**Filter modes:**
+
+| Mode | Flag | Behavior |
+|------|------|----------|
+| Post-filter (default) | `--filter-mode post` | Overfetches k×2 per centroid, discards non-matching. Fast, default. |
+| Pre-filter | `--filter-mode pre` | Uses reverse index per centroid to restrict FAISS search to only matching IDs. May find results post-filter misses. |
+
+Post-filter is the default and performs well for most use cases. Pre-filter
+may find more results since it doesn't rely on overfetching, at the cost of
+loading a reverse index per centroid.
+
+**Get vectors by tags:**
+
+```bash
+blocks-db get-by-tags mydataset --filter '{"priority":"high"}' --limit 20
+```
+
+Lists vector IDs whose tags match the filter. Useful for inspection.
+
 **Custom batch size** (number of centroid `.ann` files per map worker):
 ```bash
 blocks-db query mydataset --file queries.csv --batch-size 2
@@ -289,9 +347,11 @@ blocks-db status mydataset -v
 | `update-threshold` | Update auto-indexer block size threshold | `blocks-db update-threshold [bytes] --dataset <name>` |
 | `initialize-database` | Upload dataset and build initial index | `blocks-db initialize-database <n> <csv> --config <j> [--build-local]` |
 | `put` | Add vectors to pending storage | `blocks-db put <name> <csv> [--tags <json>] [--single]` |
-| `query` | Search vectors (indexed + pending by default) | `blocks-db query <n> --file <csv> --k <N> [--filter <j>] [--batch-size <N>]` |
+| `query` | Search vectors (indexed + pending by default) | `blocks-db query <n> --file <csv> --k <N> [--filter <j>] [--filter-mode post\|pre] [--batch-size <N>]` |
 | `status` | Show dataset status and index info | `blocks-db status <name> [-v]` |
 | `get` | Retrieve vectors by ID, list vectors, or show pending | `blocks-db get <n> <id>... [--limit N] [--pending]` |
+| `get-by-tags` | List vector IDs matching tags | `blocks-db get-by-tags <n> --filter <json> [--limit N]` |
+| `delete-dataset` | Delete dataset and all its data | `blocks-db delete-dataset <n> [--yes]` |
 
 ### `get` command usage
 
@@ -319,23 +379,18 @@ First column: ID (integer), rest: space-separated values.
 2 0.4 0.5 0.6 ...
 ```
 
----
+### Vectors CSV with Per-Vector Tags
 
-## 🗂️ S3 Structure
+Add a third column with a JSON object for per-vector tags:
 
 ```
-your-bucket/
-├── vectors_<dataset>.csv              # Main dataset
-├── csv_blocks_<dataset>.json          # Block index for fast ID lookup
-├── pending/<dataset>/                 # Pending vectors (individual CSVs)
-├── processed/<dataset>/               # Processed pending batches
-├── tracking/                          # Vector tracking metadata
-├── indexes/<dataset>/blocks/
-│   ├── config.json
-│   └── centroid_*.ann                 # FAISS index blocks
-├── datasets/<dataset>/source.csv      # Alternative dataset path
-└── inputs/                            # Temporary Lithops data
+1 0.1 0.2 ... {"source":"web","priority":"high"}
+2 0.4 0.5 ... {"source":"api","priority":"low"}
 ```
+
+When the third column is present, `initialize-database` and the auto-indexer
+Lambda store the tags alongside each vector in the index. Vectors without a
+third column are untagged and match any filter.
 
 ---
 
@@ -350,6 +405,8 @@ client = VectorDBClient(bucket="your-bucket", region="us-east-1")
 vector = [0.1, 0.2, ...]
 results, times = client.query("mydataset", vector)
 ```
+
+> 📖 Full API reference: [docs/python-client.md](docs/python-client.md)
 
 ---
 
@@ -367,13 +424,11 @@ Blocks-DB needs the following permissions (created automatically by `setup`):
 
 ---
 
-## 📝 Notes
+## Architecture
 
-- **Auto-indexer**: In S3 Triggers mode, uploading a CSV to `pending/<dataset>/` fires the Lambda. In SQS mode, the CLI posts a message after each `put`.
-- **S3 Express One Zone**: Bucket name must end with `--<az>--x-s3` (auto-detected). Uses SQS since Express buckets don't support S3 notifications.
-- **Tag filtering**: Requires DynamoDB. Tags are stored per pending file; centroids aggregate tags from all their pending files. Only centroids and pending files matching ALL filter tags are searched.
-- **Default search** is hybrid (index + pending). Use `--indexed-only` to search only the existing index.
-- **Threshold**: Controls the accumulated pending size (in bytes) that triggers the auto-indexer. Auto-calculated from dataset config or set manually.
+See [`vectordb/README.md`](vectordb/README.md#architecture) for the full architecture
+documentation, including project structure, S3 layout, DynamoDB schema, tag system,
+filter modes, auto-indexer Lambda, indexing/search pipelines, and common pitfalls.
 
 ---
 

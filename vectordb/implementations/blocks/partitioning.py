@@ -1,4 +1,5 @@
 import csv
+import json
 from io import StringIO
 
 
@@ -22,6 +23,7 @@ class BlockPartitioner:
         blocks = []
         vectors = []
         ids = []
+        tags_list = []
 
         i = 0
 
@@ -31,14 +33,29 @@ class BlockPartitioner:
             vector = [float(v) for v in vector if v != ""]
 
             vectors.append(vector)
-            ids.append(int(row[0]))
+            vid = int(row[0])
+            ids.append(vid)
+
+            tags = None
+            if len(row) > 2 and row[2].strip():
+                try:
+                    t = json.loads(row[2])
+                    if isinstance(t, dict):
+                        tags = t
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            tags_list.append(tags)
 
             if len(vectors) == n_vecs_per_block[i]:
-
-                blocks.append((ids, vectors))
+                tags_dict = {}
+                for j, t in enumerate(tags_list):
+                    if t:
+                        tags_dict[str(ids[j])] = t
+                blocks.append((ids, vectors, tags_dict))
 
                 ids = []
                 vectors = []
+                tags_list = []
 
                 i += 1
 

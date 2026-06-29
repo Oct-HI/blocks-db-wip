@@ -91,18 +91,29 @@ class VectorIndexTracker:
             print(f"Error reading next_id from DynamoDB: {e}")
             return 0
 
-    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], create_file: bool = True, tags: dict = None) -> str:
+    def put_vectors(self, dataset_name: str, vectors: List[Tuple[int, List[float]]], create_file: bool = True, tags: dict = None, per_vector_tags: List[Optional[dict]] = None) -> str:
         if not vectors:
             return None
         file_id = str(int(time.time() * 1000))
         key = self.get_pending_file_key(dataset_name, file_id)
-        
+
+        has_per_vector_tags = per_vector_tags is not None and any(t is not None for t in per_vector_tags)
         csv_buffer = io.StringIO()
         writer = csv.writer(csv_buffer)
-        writer.writerow(["id", "vector"])
-        for vec_id, vec in vectors:
-            vec_str = " ".join(str(x) for x in vec)
-            writer.writerow([vec_id, vec_str])
+        if has_per_vector_tags:
+            writer.writerow(["id", "vector", "tags"])
+            for i, (vec_id, vec) in enumerate(vectors):
+                vec_str = " ".join(str(x) for x in vec)
+                t = per_vector_tags[i] if i < len(per_vector_tags) else None
+                if t:
+                    writer.writerow([vec_id, vec_str, json.dumps(t)])
+                else:
+                    writer.writerow([vec_id, vec_str])
+        else:
+            writer.writerow(["id", "vector"])
+            for vec_id, vec in vectors:
+                vec_str = " ".join(str(x) for x in vec)
+                writer.writerow([vec_id, vec_str])
         csv_bytes = csv_buffer.getvalue().encode("utf-8")
 
         extra_args = {}
@@ -206,8 +217,8 @@ class VectorIndexTracker:
                     line = raw_line.decode()
                     if line.startswith("id,"):
                         continue
-                    parts = line.split(",", 1)
-                    if len(parts) == 2:
+                    parts = line.split(",", 2)
+                    if len(parts) >= 2:
                         try:
                             vec_id = int(parts[0])
                             vec = [float(x) for x in parts[1].strip().split() if x]
@@ -254,6 +265,52 @@ class VectorIndexTracker:
             self.s3.delete_objects(Bucket=self.bucket, Delete={"Objects": objects})
         self.clear_pending_file_tracking(dataset_name)
 
+    def _delete_ddb_dataset_items(self, dataset_name: str):
+        """Delete all DynamoDB items belonging to a dataset."""
+        try:
+            self.table.delete_item(
+                Key={"centroid_id": f"{dataset_name}_CONFIG", "sk": "META"}
+            )
+        except:
+            pass
+
+        try:
+            self.table.delete_item(
+                Key={"centroid_id": f"{dataset_name}_ID_TRACKER", "sk": "META"}
+            )
+        except:
+            pass
+
+        try:
+            response = self.table.query(
+                KeyConditionExpression=(
+                    boto3.dynamodb.conditions.Key('centroid_id').eq(f"DATASET#{dataset_name}")
+                )
+            )
+            for item in response.get("Items", []):
+                try:
+                    self.table.delete_item(
+                        Key={"centroid_id": item["centroid_id"], "sk": item["sk"]}
+                    )
+                except:
+                    pass
+        except:
+            pass
+
+        try:
+            response = self.table.query(
+                KeyConditionExpression=boto3.dynamodb.conditions.Key('centroid_id').begins_with(f"{dataset_name}#")
+            )
+            for item in response.get("Items", []):
+                try:
+                    self.table.delete_item(
+                        Key={"centroid_id": item["centroid_id"], "sk": item["sk"]}
+                    )
+                except:
+                    pass
+        except:
+            pass
+
     def delete_tracking(self, dataset_name: str):
         files = self.get_pending_files(dataset_name)
         if files:
@@ -267,3 +324,4 @@ class VectorIndexTracker:
             self.s3.delete_object(Bucket=self.bucket, Key=indexed_files_key)
         except:
             pass
+        self._delete_ddb_dataset_items(dataset_name)

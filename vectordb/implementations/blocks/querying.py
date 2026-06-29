@@ -42,11 +42,14 @@ def _centroid_tags_match(centroid_tags, filter_tags):
 def _get_matching_centroids(table, dataset, num_index, filter_tags):
     """Query DynamoDB for centroids whose aggregated tags match the filter.
     Returns list of centroid IDs (ints) that match.
+
+    Centroids without a DDB tag record are excluded (they have no tags, so
+    they cannot match any filter). Centroids with a DDB record are filtered.
     """
     if not filter_tags:
         return list(range(num_index))
 
-    matching = []
+    centroids_with_ddb = {}
 
     try:
         response = table.query(
@@ -62,8 +65,14 @@ def _get_matching_centroids(table, dataset, num_index, filter_tags):
 
     for item in items:
         cid = int(item["sk"].split("#")[1])
-        tags = item.get("tags")
-        if tags and _centroid_tags_match(tags, filter_tags):
+        centroids_with_ddb[cid] = item.get("tags")
+
+    matching = []
+    for cid in range(num_index):
+        if cid not in centroids_with_ddb:
+            continue
+        tags = centroids_with_ddb[cid]
+        if not tags or _centroid_tags_match(tags, filter_tags):
             matching.append(cid)
 
     return matching
@@ -173,14 +182,72 @@ def _search_indexed(task_spec, k, storage, config, start, source="indexed"):
         for key in queries_key[1]
     }
 
+    filter_tags = getattr(config, 'filter_tags', None)
+    overfetch = getattr(config, 'post_filter_overfetch', 3)
+    filter_mode = getattr(config, 'filter_mode', 'post')
+
     res_queries = defaultdict(list)
 
     for file_idx, (key, queries) in enumerate(queries_json.items()):
         storage.download_file(config.storage_bucket, key, f'/tmp/index_{file_idx}.ann')
         index = faiss.read_index(f'/tmp/index_{file_idx}.ann')
-        d, i = index.search(np.array(queries), k)
-        for x in range(len(queries)):
-            res_queries[x].append([d[x].tolist(), i[x].tolist()])
+
+        centroid_tags = {}
+        reverse_data = None
+        if filter_tags:
+            cid = queries_key[1][file_idx] if file_idx < len(queries_key[1]) else None
+            if cid is not None:
+                tags_key = f'indexes/{config.dataset}/{config.implementation}/centroid_{cid}_tags.json'
+                try:
+                    raw = storage.get_object(bucket=config.storage_bucket, key=tags_key)
+                    if isinstance(raw, bytes):
+                        raw = raw.decode()
+                    centroid_tags = json.loads(raw)
+                except Exception:
+                    pass
+
+                if filter_mode == 'pre':
+                    reverse_key = tags_key.replace('_tags.json', '_reverse_tags.json')
+                    try:
+                        raw = storage.get_object(bucket=config.storage_bucket, key=reverse_key)
+                        if isinstance(raw, bytes):
+                            raw = raw.decode()
+                        reverse_data = json.loads(raw)
+                    except Exception:
+                        pass
+
+        if filter_mode == 'pre' and filter_tags and reverse_data:
+            matching_ids = None
+            for fk, fv in filter_tags.items():
+                ids = set(reverse_data.get(f"{fk}:{fv}", []))
+                matching_ids = ids if matching_ids is None else matching_ids & ids
+            if matching_ids:
+                sel = faiss.IDSelectorBatch(list(matching_ids))
+                d, i = index.search(np.array(queries), k,
+                                    params=faiss.SearchParametersIVF(sel=sel))
+                for x in range(len(queries)):
+                    res_queries[x].append([d[x].tolist(), i[x].tolist()])
+            else:
+                for x in range(len(queries)):
+                    res_queries[x].append([[], []])
+        else:
+            search_k = k * overfetch if filter_tags else k
+            d, i = index.search(np.array(queries), search_k)
+            for x in range(len(queries)):
+                if filter_tags and centroid_tags:
+                    fd, fi = [], []
+                    for dist, idx in zip(d[x], i[x]):
+                        vt = centroid_tags.get(str(int(idx)))
+                        if vt is not None:
+                            if all(vt.get(tk) == tv for tk, tv in filter_tags.items()):
+                                fd.append(float(dist))
+                                fi.append(int(idx))
+                        elif not centroid_tags:
+                            fd.append(float(dist))
+                            fi.append(int(idx))
+                    res_queries[x].append([fd, fi])
+                else:
+                    res_queries[x].append([d[x].tolist(), i[x].tolist()])
         os.remove(f'/tmp/index_{file_idx}.ann')
 
     final_results = {}
@@ -204,6 +271,8 @@ def _search_pending(queries_key, pending_files, k, storage, config, start, sourc
     queries = storage.get_object(bucket=config.storage_bucket, key=queries_key)
     queries = orjson.loads(queries)
 
+    filter_tags = getattr(config, 'filter_tags', None)
+
     all_ids = []
     all_vectors = []
 
@@ -214,15 +283,40 @@ def _search_pending(queries_key, pending_files, k, storage, config, start, sourc
             continue
         if isinstance(raw, bytes):
             raw = raw.decode()
+
+        has_any_tags = False
+        rows_buffer = []
         reader = csv.reader(io.StringIO(raw))
         for row in reader:
             if not row or row[0] == "id":
                 continue
-            parts = row[0].split(",", 1) if len(row) == 1 else [row[0], ",".join(row[1:])]
-            if len(parts) < 2:
+            if len(row) < 2:
                 continue
-            vid = int(parts[0])
-            vec = [float(x) for x in parts[1].strip().split() if x]
+            rows_buffer.append(row)
+            if len(row) > 2 and row[2].strip():
+                has_any_tags = True
+
+        for row in rows_buffer:
+            try:
+                vid = int(row[0])
+                vec = [float(x) for x in row[1].strip().split() if x]
+            except (ValueError, IndexError):
+                continue
+
+            tags = None
+            if len(row) > 2 and row[2].strip():
+                try:
+                    tags = json.loads(row[2]) if isinstance(row[2], str) else row[2]
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            if filter_tags:
+                if tags is not None:
+                    if not all(tags.get(k) == v for k, v in filter_tags.items()):
+                        continue
+                elif has_any_tags:
+                    continue
+
             all_ids.append(vid)
             all_vectors.append(vec)
 

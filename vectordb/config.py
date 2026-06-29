@@ -65,10 +65,16 @@ class SvlessVectorDBParams:
     
     # Hybrid search settings
     auto_index_threshold_mb: Optional[int] = None
-    dynamodb_table_name: str = "BlocksDB-VectorIndex"
+    dynamodb_table_name: str = "BlocksDB-default"
     
     # Tag filtering (per-query, not persisted)
     filter_tags: dict = None
+
+    # Post-filter overfetch multiplier (k * overfetch candidates before tag filter)
+    post_filter_overfetch: int = 2
+
+    # Tag filter mode: 'post' (overfetch + loop) or 'pre' (reverse-index + IDSelectorBatch)
+    filter_mode: str = "post"
 
     # DynamoDB connection info (injected at query time)
     dynamodb_region: str = None
