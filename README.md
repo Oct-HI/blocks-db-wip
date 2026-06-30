@@ -230,6 +230,10 @@ blocks-db initialize-database mydataset vectors.csv --config config.json --no-up
 # Build csv_blocks from local file (skip S3 re-download during tracking)
 blocks-db initialize-database mydataset vectors.csv --config config.json --build-local
 
+# Custom CSV block size for optimized vector reads (gets)
+# Auto-calculated from index config if not set
+blocks-db initialize-database mydataset vectors.csv --config config.json --csv-block-size 1000000
+
 # Skip DynamoDB state init and vector tracking (benchmark purity)
 blocks-db initialize-database mydataset vectors.csv --config config.json --skip-auto-indexer
 ```
