@@ -83,3 +83,4 @@ class SvlessVectorDBParams:
     total_vectors: int = -1
     bytes_per_vector: int = 776
     bytes_per_block: int = 5242880
+    csv_block_size: int = 500000

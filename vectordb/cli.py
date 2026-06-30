@@ -77,6 +77,7 @@ def main():
     init_parser.add_argument("--no-update-threshold", action="store_true", help="Skip auto-update threshold after indexing")
     init_parser.add_argument("--skip-auto-indexer", action="store_true", help="Skip DynamoDB state init and vector tracking (for pure benchmarks)")
     init_parser.add_argument("--build-local", action="store_true", help="Build csv_blocks from local file (skip S3 re-download during tracking)")
+    init_parser.add_argument("--csv-block-size", type=int, default=None, help="CSV block size in bytes for optimized vector reads (default: auto-calculated from index config)")
 
     # ── put ───────────────────────────────────────────────────
     put_parser = subparsers.add_parser("put", help="Add new vectors (stored as individual files)")
@@ -267,6 +268,9 @@ def main():
 
         with open(args.config) as f:
             config = json.load(f)
+
+        if args.csv_block_size is not None:
+            config["csv_block_size"] = args.csv_block_size
 
         print(f"\n=== Building index ===")
         times = client.index_dataset(

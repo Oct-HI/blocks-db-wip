@@ -47,7 +47,8 @@ your-bucket/
 ├── csv_blocks_<dataset>.json          # Block index for fast ID lookup
 ├── pending/<dataset>/                 # Pending vectors (individual CSVs)
 ├── processed/<dataset>/               # Processed pending batches
-├── tracking/                          # Vector tracking metadata
+├── tracking/
+│   └── csv_blocks_<dataset>.json      # Byte-offset chunks for fast ID-based vector retrieval
 ├── indexes/<dataset>/blocks/
 │   ├── config.json
 │   ├── centroid_*.ann                 # FAISS index blocks
@@ -96,6 +97,7 @@ Each subdirectory contains a README.md detailing its files:
 - **k** (config): IVF k-means clusters per block during initial build. During auto-indexing, k is computed dynamically as `max(1, min(4096, len(vectors) // 4))`.
 - **n_probe**: IVF search parameter — number of clusters to visit within each block during search. Higher values improve recall at the cost of latency.
 - **query_batch_size**: number of centroid `.ann` files assigned to each Lithops map worker. Controls parallelism: total map workers = `ceil(num_index / query_batch_size)` + 1 (pending). Default 4.
+- **csv_blocks**: byte-offset chunks of the source CSV stored at `tracking/csv_blocks_{dataset}.json`. Built during `initialize-database` for efficient Range GETs when retrieving vectors by ID (`blocks-db get`). Auto-calculated from index config or overridable via `--csv-block-size`.
 - **features**: vector dimensionality (e.g. 96 for deep_100k, 384 for all-MiniLM-L6-v2, 1536 for ada-002).
 - **index_mem / search_map_mem / search_reduce_mem**: Lambda memory in MB for indexing, search map, and search reduce phases respectively.
 

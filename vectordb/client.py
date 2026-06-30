@@ -247,7 +247,10 @@ class VectorDBClient:
         bytes_per_block = vectors_per_block * bytes_per_vector
 
         use_s3express = is_s3express_bucket(self.bucket)
-        
+
+        csv_block_size = max(50 * bytes_per_vector, bytes_per_block)
+        csv_block_size = config.get("csv_block_size", csv_block_size)
+
         print(f"\nBlock size info:")
         print(f"  Total vectors: {total_vectors:,}")
         print(f"  Features: {features}")
@@ -264,6 +267,7 @@ class VectorDBClient:
             config["total_vectors"] = total_vectors
             config["bytes_per_vector"] = bytes_per_vector
             config["bytes_per_block"] = bytes_per_block
+            config["csv_block_size"] = csv_block_size
             t0 = time.time()
             self.save_index_config(dataset_name, config)
             if setup_auto_indexer:
@@ -276,7 +280,7 @@ class VectorDBClient:
 
         if track_indexed and setup_auto_indexer:
             t0 = time.time()
-            self._track_indexed_vectors_from_csv(dataset_name, features, use_s3express=use_s3express, prebuilt_blocks=csv_blocks)
+            self._track_indexed_vectors_from_csv(dataset_name, features, use_s3express=use_s3express, prebuilt_blocks=csv_blocks, csv_block_size=csv_block_size)
             total_times["tracking_time"] = time.time() - t0
 
         return total_times
@@ -294,17 +298,10 @@ class VectorDBClient:
     
     def _setup_auto_indexer_state(self, dataset_name: str, config: dict):
         """Set up DynamoDB state for auto-indexer to continue from where manual indexing left off."""
-        from pathlib import Path
-        
+
         dynamodb = boto3.resource("dynamodb")
-        
-        config_path = Path(__file__).parent.parent / "infra" / "infrastructure_config.json"
-        if config_path.exists():
-            import json
-            infra_config = json.loads(config_path.read_text())
-            table_name = infra_config.get("dynamodb_table_name", "BlocksDB-default")
-        else:
-            table_name = "BlocksDB-default"
+
+        table_name = "BlocksDB-default"
         
         try:
             table = dynamodb.Table(table_name)
@@ -321,16 +318,10 @@ class VectorDBClient:
 
     def _aggregate_centroid_tags_to_ddb(self, dataset_name: str, num_index: int, config: dict):
         """Read per-vector _tags.json from S3 and write aggregated centroid-level tags to DynamoDB."""
-        from pathlib import Path
 
         implementation = config.get("implementation", "blocks")
-        config_path = Path(__file__).parent.parent / "infra" / "infrastructure_config.json"
-        if config_path.exists():
-            import json as _j
-            infra_config = _j.loads(config_path.read_text())
-            table_name = infra_config.get("dynamodb_table_name", "BlocksDB-default")
-        else:
-            table_name = "BlocksDB-default"
+
+        table_name = "BlocksDB-default"
 
         s3 = boto3.client("s3")
         try:
@@ -453,7 +444,7 @@ class VectorDBClient:
         self.tracker.mark_vectors_indexed(dataset_name, pending_ids)
         print(f"Marked {len(pending_ids)} pending vectors as indexed for hybrid search.")
 
-    def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int, use_s3express: bool = False, prebuilt_blocks: tuple = None):
+    def _track_indexed_vectors_from_csv(self, dataset_name: str, features: int, use_s3express: bool = False, prebuilt_blocks: tuple = None, csv_block_size: int = BLOCK_SIZE):
         """Read the main CSV and track all vectors as indexed + build csv_blocks for optimized get.
 
         If prebuilt_blocks=(blocks, last_vid) is provided, skip S3 download
@@ -473,7 +464,7 @@ class VectorDBClient:
             return
 
         key = f"datasets/{dataset_name}/source.csv"
-        block_size = 500000  # ~500KB per block
+        block_size = csv_block_size
         blocks = []
 
         try:

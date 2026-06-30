@@ -802,7 +802,7 @@ def create_lambda_with_code_and_layer(s3_bucket, layer_arn=None, function_name=N
     
     kwargs = {
         'FunctionName': function_name,
-        'Runtime': config.get("lambda_runtime", "python3.13"),
+        'Runtime': config.get("lambda_runtime", "python3.12"),
         'Role': role_arn,
         'Handler': 'index.lambda_handler',
         'Code': {'ZipFile': zip_data},

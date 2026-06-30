@@ -29,7 +29,7 @@ s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "BlocksDB-default")
-DEFAULT_THRESHOLD_BYTES = int(os.environ.get("THRESHOLD_SIZE_BYTES", "33554432"))
+DEFAULT_THRESHOLD_BYTES = int(os.environ.get("THRESHOLD_SIZE_BYTES", "5242880"))
 INDEX_IMPLEMENTATION = os.environ.get("INDEX_IMPLEMENTATION", "blocks")
 BYTES_PER_VECTOR = 8 + 96 * 8
 
@@ -373,7 +373,7 @@ def create_index_for_centroid(centroid_id: int, bucket: str, dataset: str, table
 
     next_available_id = get_next_available_id_atomic(bucket, dataset, len(original_ids))
     new_ids = list(range(next_available_id, next_available_id + len(original_ids)))
-    print(f"Reassigning IDs: {len(original_ids)} vectors from IDs {min(original_ids)}-{max(original_ids)} to {next_available_id}-{next_available_id + len(new_ids) - 1}")
+    print(f"Reassigning IDs: {len(original_ids)} vectors from IDs {min(original_ids)}-{max(original_ids)} to {next_available_id}-{next_available_id + len(original_ids) - 1}")
 
     tags_dict = {}
     for i, nid in enumerate(new_ids):
